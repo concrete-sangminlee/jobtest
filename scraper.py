@@ -1,13 +1,14 @@
 import json
 import os
 import re
+import subprocess
 import sys
+import time
 from html import unescape
 from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
 
 BASE_URL = "https://hibrain.net"
 LIST_URL = f"{BASE_URL}/recruitment/recruits?listType=D3NEW&pagesize=50&sortType=SORTDTM"
@@ -31,38 +32,54 @@ def extract_job_id(href: str) -> str:
     return match.group(1) if match else ""
 
 
-def fetch_page() -> str:
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-            ],
-        )
-        context = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (X11; Linux x86_64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            ),
-            locale="ko-KR",
-        )
-        page = context.new_page()
-        # navigator.webdriver 속성 제거
-        page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+def fetch_with_curl_cffi() -> str:
+    from curl_cffi import requests as curl_requests
+    resp = curl_requests.get(LIST_URL, impersonate="chrome", timeout=30)
+    resp.raise_for_status()
+    return resp.text
 
-        page.goto(LIST_URL, timeout=30000)
-        try:
-            page.wait_for_selector("#articleList li.row", timeout=15000)
-        except Exception:
-            print(f"페이지 로딩 실패. 페이지 제목: {page.title()}")
-            print(page.content()[:500])
-            browser.close()
-            raise
-        html = page.content()
-        browser.close()
-    return html
+
+def fetch_with_system_curl() -> str:
+    result = subprocess.run(
+        [
+            "curl", "-s", "-L",
+            "-H", "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "-H", "Accept-Language: ko-KR,ko;q=0.9",
+            "-H", "Referer: https://hibrain.net/recruitment",
+            "--compressed",
+            LIST_URL,
+        ],
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"curl failed: {result.stderr}")
+    if "403 ERROR" in result.stdout or "<H1>403 ERROR</H1>" in result.stdout:
+        raise RuntimeError("CloudFront 403 blocked")
+    return result.stdout
+
+
+def fetch_page() -> str:
+    methods = [
+        ("curl_cffi", fetch_with_curl_cffi),
+        ("system curl", fetch_with_system_curl),
+    ]
+    for name, fn in methods:
+        for attempt in range(3):
+            try:
+                print(f"  {name} 시도 {attempt + 1}/3...")
+                html = fn()
+                if "articleList" in html:
+                    print(f"  {name} 성공!")
+                    return html
+                print(f"  {name}: articleList를 찾을 수 없음")
+            except Exception as e:
+                print(f"  {name} 실패: {e}")
+            if attempt < 2:
+                wait = 5 * (attempt + 1)
+                print(f"  {wait}초 후 재시도...")
+                time.sleep(wait)
+    raise RuntimeError("모든 방법으로 페이지를 가져오지 못했습니다.")
 
 
 def scrape_jobs() -> list[dict]:
