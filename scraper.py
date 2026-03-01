@@ -1,11 +1,10 @@
 import json
 import os
 import re
-import subprocess
 import sys
-import time
 from html import unescape
 from pathlib import Path
+from urllib.parse import quote
 
 import requests
 from bs4 import BeautifulSoup
@@ -32,60 +31,25 @@ def extract_job_id(href: str) -> str:
     return match.group(1) if match else ""
 
 
-def fetch_with_curl_cffi() -> str:
-    from curl_cffi import requests as curl_requests
-    resp = curl_requests.get(LIST_URL, impersonate="chrome", timeout=30)
+def fetch_page() -> str:
+    scraper_api_key = os.environ.get("SCRAPER_API_KEY")
+    if scraper_api_key:
+        print("ScraperAPI를 통해 페이지 가져오는 중...")
+        url = f"http://api.scraperapi.com?api_key={scraper_api_key}&url={quote(LIST_URL)}"
+        resp = requests.get(url, timeout=60)
+    else:
+        print("직접 요청으로 페이지 가져오는 중...")
+        resp = requests.get(LIST_URL, headers={
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        }, timeout=30)
     resp.raise_for_status()
     return resp.text
-
-
-def fetch_with_system_curl() -> str:
-    result = subprocess.run(
-        [
-            "curl", "-s", "-L",
-            "-H", "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-            "-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "-H", "Accept-Language: ko-KR,ko;q=0.9",
-            "-H", "Referer: https://hibrain.net/recruitment",
-            "--compressed",
-            LIST_URL,
-        ],
-        capture_output=True, text=True, timeout=30,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"curl failed: {result.stderr}")
-    if "403 ERROR" in result.stdout or "<H1>403 ERROR</H1>" in result.stdout:
-        raise RuntimeError("CloudFront 403 blocked")
-    return result.stdout
-
-
-def fetch_page() -> str:
-    methods = [
-        ("curl_cffi", fetch_with_curl_cffi),
-        ("system curl", fetch_with_system_curl),
-    ]
-    for name, fn in methods:
-        for attempt in range(3):
-            try:
-                print(f"  {name} 시도 {attempt + 1}/3...")
-                html = fn()
-                if "articleList" in html:
-                    print(f"  {name} 성공!")
-                    return html
-                print(f"  {name}: articleList를 찾을 수 없음")
-            except Exception as e:
-                print(f"  {name} 실패: {e}")
-            if attempt < 2:
-                wait = 5 * (attempt + 1)
-                print(f"  {wait}초 후 재시도...")
-                time.sleep(wait)
-    raise RuntimeError("모든 방법으로 페이지를 가져오지 못했습니다.")
 
 
 def scrape_jobs() -> list[dict]:
     try:
         text = fetch_page()
-    except RuntimeError as e:
+    except Exception as e:
         print(f"페이지 가져오기 실패: {e}")
         return []
 
@@ -187,7 +151,7 @@ def main():
     print(f"총 {len(jobs)}개 공고 발견")
 
     if not jobs:
-        print("공고를 가져오지 못했습니다. (CloudFront 차단 가능성 - 다음 주기에 재시도)")
+        print("공고를 가져오지 못했습니다. (다음 주기에 재시도)")
         sys.exit(0)
 
     if test_mode:
