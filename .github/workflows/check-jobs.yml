@@ -3,7 +3,12 @@ name: Check hibrain.net Job Postings
 on:
   schedule:
     - cron: "0 * * * *" # 매 1시간
-  workflow_dispatch: # 수동 실행 가능
+  workflow_dispatch:
+    inputs:
+      test_mode:
+        description: "테스트 모드 (샘플 3건만 Slack 전송)"
+        type: boolean
+        default: false
 
 jobs:
   check-jobs:
@@ -27,6 +32,7 @@ jobs:
       - name: Run scraper
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          TEST_MODE: ${{ inputs.test_mode }}
         run: python scraper.py
 
       - name: Commit updated seen_jobs.json

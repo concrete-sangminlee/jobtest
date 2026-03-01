@@ -131,6 +131,11 @@ def send_to_slack(message: dict) -> None:
 
 
 def main():
+    test_mode = os.environ.get("TEST_MODE", "").lower() == "true"
+
+    if test_mode:
+        print("[테스트 모드] 최근 3개 공고를 샘플로 Slack에 전송합니다.")
+
     print("hibrain.net 채용정보 스크래핑 시작...")
 
     jobs = scrape_jobs()
@@ -139,6 +144,14 @@ def main():
     if not jobs:
         print("공고를 가져오지 못했습니다.")
         sys.exit(1)
+
+    if test_mode:
+        sample = jobs[:3]
+        message = build_slack_message(sample)
+        message["blocks"][0]["text"]["text"] = "🧪 [테스트] 하이브레인 채용공고 알림 테스트"
+        send_to_slack(message)
+        print(f"테스트 메시지 전송 완료 ({len(sample)}건)")
+        return
 
     seen = load_seen()
     seen_set = set(seen)
