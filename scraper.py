@@ -5,6 +5,7 @@ import sys
 from html import unescape
 from pathlib import Path
 
+import cloudscraper
 import requests
 from bs4 import BeautifulSoup
 
@@ -12,24 +13,6 @@ BASE_URL = "https://hibrain.net"
 LIST_URL = f"{BASE_URL}/recruitment/recruits?listType=D3NEW&pagesize=50&sortType=SORTDTM"
 SEEN_FILE = Path(__file__).parent / "seen_jobs.json"
 MAX_SEEN = 500
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/131.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Referer": "https://hibrain.net/recruitment",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "same-origin",
-    "Sec-Fetch-User": "?1",
-    "Upgrade-Insecure-Requests": "1",
-}
 
 
 def load_seen() -> list[str]:
@@ -51,11 +34,8 @@ def extract_job_id(href: str) -> str:
 
 
 def fetch_page() -> str:
-    session = requests.Session()
-    # 먼저 메인 페이지 방문하여 쿠키 획득
-    session.get(f"{BASE_URL}/recruitment", headers=HEADERS, timeout=30)
-    # 이후 목록 페이지 요청
-    resp = session.get(LIST_URL, headers=HEADERS, timeout=30)
+    scraper = cloudscraper.create_scraper(browser={"browser": "chrome", "platform": "linux"})
+    resp = scraper.get(LIST_URL, timeout=30)
     resp.raise_for_status()
     return resp.text
 
