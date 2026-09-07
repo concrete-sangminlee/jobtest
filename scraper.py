@@ -167,21 +167,95 @@ def build_slack_message(new_jobs: list[dict]) -> dict:
     }
 
 
-def send_to_slack(message: dict) -> None:
+def webhook_label(url: str) -> str:
+    """웹훅 URL에서 토큰을 제거한 식별용 라벨. (로그에 시크릿이 남지 않도록)"""
+    parts = url.rstrip("/").split("/")
+    if len(parts) >= 2:
+        return f".../{parts[-2]}/***"
+    return "***"
+
+
+def redact(text: str, url: str) -> str:
+    """예외/응답 메시지에 섞여 있을 수 있는 웹훅 토큰을 가립니다."""
+    token = url.rstrip("/").rsplit("/", 1)[-1]
+    return text.replace(token, "***") if token else text
+
+
+# Slack 웹훅이 돌려주는 에러 본문별 안내
+SLACK_ERROR_HINTS = {
+    "channel_is_archived": "채널이 아카이브되었습니다. 채널을 복구하거나 SLACK_WEBHOOK_URL에서 이 웹훅을 제거하세요.",
+    "channel_not_found": "채널을 찾을 수 없습니다. 공개→비공개 전환 후 앱이 채널에서 빠졌을 수 있습니다. 해당 채널에 앱을 다시 초대하세요.",
+    "no_service": "웹훅이 삭제되었습니다. Slack 앱 설정에서 새로 발급받아 SLACK_WEBHOOK_URL을 갱신하세요.",
+    "no_team": "워크스페이스에서 앱이 제거되었습니다. 앱을 다시 설치하세요.",
+    "invalid_token": "웹훅 토큰이 유효하지 않습니다. 새로 발급받아 SLACK_WEBHOOK_URL을 갱신하세요.",
+    "action_prohibited": "워크스페이스 관리 정책으로 이 웹훅이 차단되었습니다.",
+}
+
+
+def explain_slack_error(status: int, body: str) -> tuple[str, bool]:
+    """(안내 문구, 영구적 실패 여부)를 반환합니다."""
+    hint = SLACK_ERROR_HINTS.get(body.strip())
+    if hint:
+        return hint, True
+    if status in (404, 410):
+        return (
+            "웹훅이 비활성화되었습니다. 채널 아카이브·앱 제거 등으로 폐기된 웹훅입니다. "
+            "SLACK_WEBHOOK_URL에서 제거하거나 새 웹훅으로 교체하세요.",
+            True,
+        )
+    if status == 403:
+        return "권한이 없습니다. 비공개 채널로 전환된 뒤 앱이 채널에서 빠졌는지 확인하세요.", True
+    if status == 429:
+        return "요청이 제한되었습니다. 다음 주기에 재시도합니다.", False
+    if status >= 500:
+        return "Slack 측 일시적 오류입니다. 다음 주기에 재시도합니다.", False
+    return "알 수 없는 오류입니다.", False
+
+
+def warn(text: str) -> None:
+    """GitHub Actions 실행 요약에도 보이도록 경고를 남깁니다."""
+    prefix = "::warning::" if os.environ.get("GITHUB_ACTIONS") == "true" else "⚠️  "
+    print(f"{prefix}{text}")
+
+
+def send_to_slack(message: dict) -> tuple[int, int]:
+    """메시지를 모든 웹훅에 전송하고 (성공 채널 수, 설정된 채널 수)를 반환합니다.
+
+    한 채널이 실패해도 나머지 채널 전송은 계속 진행합니다.
+    """
     webhook_urls = os.environ.get("SLACK_WEBHOOK_URL", "")
     if not webhook_urls:
         print("SLACK_WEBHOOK_URL 환경변수가 설정되지 않았습니다.")
         print("Slack 전송을 건너뜁니다.")
         print(json.dumps(message, ensure_ascii=False, indent=2))
-        return
+        return 0, 0
 
-    for i, url in enumerate(webhook_urls.split(","), 1):
-        url = url.strip()
-        if not url:
+    urls = [u.strip() for u in webhook_urls.split(",") if u.strip()]
+    delivered = 0
+
+    for i, url in enumerate(urls, 1):
+        label = f"채널 {i} ({webhook_label(url)})"
+        try:
+            resp = requests.post(url, json=message, timeout=10)
+        except requests.RequestException as e:
+            print(f"Slack {label} 전송 실패 (네트워크 오류): {redact(str(e), url)}")
             continue
-        resp = requests.post(url, json=message, timeout=10)
-        resp.raise_for_status()
-        print(f"Slack 채널 {i} 전송 완료!")
+
+        if resp.ok:
+            delivered += 1
+            print(f"Slack {label} 전송 완료!")
+            continue
+
+        body = redact(resp.text.strip(), url)
+        hint, permanent = explain_slack_error(resp.status_code, body)
+        detail = f"Slack {label} 전송 실패: HTTP {resp.status_code} {body} — {hint}"
+        if permanent:
+            warn(detail)
+        else:
+            print(detail)
+
+    print(f"Slack 전송 결과: {delivered}/{len(urls)} 채널 성공")
+    return delivered, len(urls)
 
 
 def main():
@@ -204,7 +278,10 @@ def main():
         message = build_slack_message(sample)
         message["attachments"][0]["blocks"][0]["text"]["text"] = "*🧪  [테스트] 하이브레인 채용공고 알림*"
         message["attachments"][0]["color"] = "#f2c744"
-        send_to_slack(message)
+        delivered, total = send_to_slack(message)
+        if total and not delivered:
+            print("모든 Slack 채널 전송에 실패했습니다.")
+            sys.exit(1)
         print(f"테스트 메시지 전송 완료 ({len(sample)}건)")
         return
 
@@ -219,7 +296,16 @@ def main():
         return
 
     message = build_slack_message(new_jobs)
-    send_to_slack(message)
+    delivered, total = send_to_slack(message)
+
+    if total == 0:
+        print("Slack 웹훅이 없어 seen_jobs.json을 갱신하지 않습니다.")
+        return
+
+    if delivered == 0:
+        print("모든 Slack 채널 전송에 실패했습니다.")
+        print("seen_jobs.json을 갱신하지 않고 종료합니다. (다음 주기에 재시도)")
+        sys.exit(1)
 
     for job in new_jobs:
         seen.append(job["id"])
