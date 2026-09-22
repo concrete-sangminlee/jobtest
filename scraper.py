@@ -12,16 +12,33 @@ from urllib.parse import quote
 import requests
 from bs4 import BeautifulSoup
 
+KST = timezone(timedelta(hours=9))
+
 BASE_URL = "https://hibrain.net"
 LIST_URL = f"{BASE_URL}/recruitment/recruits?listType=D3NEW&pagesize=50&sortType=SORTDTM"
 SEEN_FILE = Path(__file__).parent / "seen_jobs.json"
 MAX_SEEN = 500
 
-# 네트워크 튜닝
-MAX_ATTEMPTS = 3           # 각 방식(ScraperAPI/직접)당 최대 시도 횟수
-BACKOFF_BASE = 3           # 재시도 대기 시간(초) = BACKOFF_BASE * 시도횟수
-SCRAPERAPI_TIMEOUT = 70    # ScraperAPI는 프록시/렌더링으로 느릴 수 있어 넉넉히
-DIRECT_TIMEOUT = 30
+
+def _env_int(name: str, default: int) -> int:
+    """환경변수를 정수로 읽되, 값이 없거나 잘못되면 기본값을 쓴다."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return default
+
+
+# 네트워크 튜닝 (환경변수로 재정의 가능)
+MAX_ATTEMPTS = _env_int("FETCH_MAX_ATTEMPTS", 3)      # 각 방식당 최대 시도 횟수
+BACKOFF_BASE = _env_int("FETCH_BACKOFF_BASE", 3)      # 재시도 대기(초) = BACKOFF_BASE * 시도횟수
+SCRAPERAPI_TIMEOUT = _env_int("SCRAPERAPI_TIMEOUT", 70)  # ScraperAPI는 프록시/렌더링으로 느릴 수 있어 넉넉히
+DIRECT_TIMEOUT = _env_int("DIRECT_TIMEOUT", 30)
+
+# Slack 메시지에 카드로 표시할 최대 공고 수 (나머지는 "외 N건"으로 요약)
+MAX_CARDS = _env_int("SLACK_MAX_CARDS", 15)
 
 BROWSER_HEADERS = {
     "User-Agent": (
@@ -31,6 +48,11 @@ BROWSER_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
 }
+
+
+def log(msg: str) -> None:
+    """KST 타임스탬프가 붙은 구조적 로그."""
+    print(f"[{datetime.now(KST):%H:%M:%S}] {msg}", flush=True)
 
 
 def load_seen() -> list[str]:
@@ -79,22 +101,22 @@ def _try_method(name: str, fetch_fn) -> Optional[str]:
     """
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            print(f"{name} 시도 {attempt}/{MAX_ATTEMPTS}...")
+            log(f"{name} 시도 {attempt}/{MAX_ATTEMPTS}...")
             html = fetch_fn()
         except requests.RequestException as e:
-            print(f"  {name} 실패: {type(e).__name__}: {e}")
+            log(f"  {name} 실패: {type(e).__name__}: {e}")
         else:
             if _looks_like_job_list(html):
-                print(f"  {name} 성공")
+                log(f"  {name} 성공")
                 return html
-            print(f"  {name} 응답에 채용 목록이 없습니다. (차단/빈 응답 가능성)")
+            log(f"  {name} 응답에 채용 목록이 없습니다. (차단/빈 응답 가능성)")
 
         if attempt < MAX_ATTEMPTS:
             wait = BACKOFF_BASE * attempt
-            print(f"  {wait}초 후 재시도...")
+            log(f"  {wait}초 후 재시도...")
             time.sleep(wait)
 
-    print(f"{name} 최종 실패")
+    log(f"{name} 최종 실패")
     return None
 
 
@@ -110,7 +132,7 @@ def fetch_page() -> str:
         html = _try_method("ScraperAPI", lambda: _fetch_via_scraperapi(scraper_api_key))
         if html is not None:
             return html
-        print("ScraperAPI가 실패하여 직접 요청으로 폴백합니다.")
+        log("ScraperAPI가 실패하여 직접 요청으로 폴백합니다.")
 
     html = _try_method("직접 요청", _fetch_direct)
     if html is not None:
@@ -123,116 +145,271 @@ def scrape_jobs() -> list[dict]:
     try:
         text = fetch_page()
     except Exception as e:
-        print(f"페이지 가져오기 실패: {e}")
+        log(f"페이지 가져오기 실패: {e}")
         return []
 
     soup = BeautifulSoup(text, "html.parser")
     article_list = soup.find("ul", id="articleList")
     if not article_list:
-        print("articleList를 찾을 수 없습니다.")
+        log("articleList를 찾을 수 없습니다.")
         return []
 
     jobs = []
+    seen_ids = set()
     for li in article_list.find_all("li", class_="row"):
-        link_tag = li.find("a", href=True)
-        if not link_tag:
-            continue
-
-        href = unescape(link_tag["href"])
-        job_id = extract_job_id(href)
-        if not job_id:
-            continue
-
-        title = link_tag.get("title", "").strip() or link_tag.get_text(strip=True)
-
-        receipt_span = li.find("span", class_="td_receipt")
-        period = ""
-        if receipt_span:
-            numbers = receipt_span.find_all("span", class_="number")
-            if len(numbers) >= 2:
-                period = f"{numbers[0].get_text(strip=True)} ~ {numbers[1].get_text(strip=True)}"
-
-        jobs.append({
-            "id": job_id,
-            "title": title,
-            "period": period,
-            "url": f"{BASE_URL}/recruitment/recruits/{job_id}",
-        })
+        job = parse_job_row(li)
+        if job and job["id"] not in seen_ids:
+            seen_ids.add(job["id"])
+            jobs.append(job)
 
     return jobs
 
 
-def build_slack_message(new_jobs: list[dict]) -> dict:
-    kst = timezone(timedelta(hours=9))
-    now = datetime.now(kst)
-    timestamp = now.strftime("%Y. %m. %d  %H:%M KST")
-    count = len(new_jobs)
-    display_jobs = new_jobs[:20]
+# 행에서 부가 정보를 뽑을 때 시도할 후보 CSS 클래스들.
+# 사이트 마크업이 조금씩 달라도 최대한 값을 건지도록 여러 후보를 순회한다.
+_COMPANY_CLASSES = ("td_company", "td_institution", "td_agency", "company", "institution")
+_REGION_CLASSES = ("td_area", "td_region", "td_location", "area", "region")
+_TYPE_CLASSES = ("td_type", "td_employ", "td_field", "type", "field")
 
-    blocks = [
+
+def _first_text(li, class_names) -> str:
+    """후보 클래스 중 처음 발견되는 요소의 텍스트를 정리해 반환한다."""
+    for cls in class_names:
+        el = li.find(class_=cls)
+        if el:
+            text = _clean(el.get_text(" ", strip=True))
+            if text:
+                return text
+    return ""
+
+
+def _clean(text: str) -> str:
+    """공백/개행을 한 칸으로 정리."""
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def parse_job_row(li) -> Optional[dict]:
+    """채용 목록의 <li.row> 하나를 구조화된 dict로 변환한다.
+
+    필수 값(id, title)이 없으면 None을 반환하고,
+    부가 값(회사/지역/유형/마감일)은 있으면 채우고 없으면 생략한다.
+    """
+    link_tag = li.find("a", href=True)
+    if not link_tag:
+        return None
+
+    href = unescape(link_tag["href"])
+    job_id = extract_job_id(href)
+    if not job_id:
+        return None
+
+    title = _clean(link_tag.get("title", "")) or _clean(link_tag.get_text(strip=True))
+    if not title:
+        return None
+
+    # 접수 기간 (시작 ~ 마감)
+    start_date = end_date = ""
+    receipt_span = li.find("span", class_="td_receipt")
+    if receipt_span:
+        numbers = receipt_span.find_all("span", class_="number")
+        if len(numbers) >= 2:
+            start_date = _clean(numbers[0].get_text(strip=True))
+            end_date = _clean(numbers[1].get_text(strip=True))
+        elif len(numbers) == 1:
+            end_date = _clean(numbers[0].get_text(strip=True))
+
+    period = f"{start_date} ~ {end_date}" if start_date and end_date else (end_date or "")
+
+    # 상시채용 여부 (접수 기간 텍스트에 '상시' 등이 들어가는 경우)
+    receipt_text = _clean(receipt_span.get_text(" ", strip=True)) if receipt_span else ""
+    always_open = any(k in receipt_text for k in ("상시", "수시", "채용시"))
+
+    d_day = compute_d_day(end_date) if end_date else None
+
+    return {
+        "id": job_id,
+        "title": title,
+        "company": _first_text(li, _COMPANY_CLASSES),
+        "region": _first_text(li, _REGION_CLASSES),
+        "job_type": _first_text(li, _TYPE_CLASSES),
+        "period": period,
+        "start_date": start_date,
+        "end_date": end_date,
+        "always_open": always_open,
+        "d_day": d_day,
+        "url": f"{BASE_URL}/recruitment/recruits/{job_id}",
+    }
+
+
+def _parse_date(text: str) -> Optional[datetime]:
+    """'2026.09.21' / '2026-09-21' / '2026.9.21' 같은 표기를 날짜로 파싱."""
+    m = re.search(r"(\d{4})\D+(\d{1,2})\D+(\d{1,2})", text or "")
+    if not m:
+        return None
+    try:
+        return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)), tzinfo=KST)
+    except ValueError:
+        return None
+
+
+def compute_d_day(end_date: str) -> Optional[int]:
+    """마감일까지 남은 일수. 오늘=0(D-DAY), 내일=1. 파싱 실패 시 None."""
+    deadline = _parse_date(end_date)
+    if not deadline:
+        return None
+    today = datetime.now(KST).replace(hour=0, minute=0, second=0, microsecond=0)
+    return (deadline - today).days
+
+
+# 색상 팔레트
+COLOR_DEFAULT = "#0054a6"   # 하이브레인 블루
+COLOR_URGENT = "#e01e5a"    # 마감 임박(빨강)
+COLOR_SOON = "#ecb22e"      # 마감 3~5일(노랑)
+
+
+def d_day_badge(job: dict) -> str:
+    """공고의 마감 상태를 한 줄 배지 문자열로 만든다."""
+    if job.get("always_open"):
+        return "♾️ `상시채용`"
+    d = job.get("d_day")
+    if d is None:
+        return ""
+    if d < 0:
+        return "⚫️ `마감`"
+    if d == 0:
+        return "🔴 `D-DAY`"
+    if d <= 3:
+        return f"🔴 `D-{d}` 마감임박"
+    if d <= 7:
+        return f"🟡 `D-{d}`"
+    return f"🟢 `D-{d}`"
+
+
+def _accent_color(jobs: list[dict]) -> str:
+    """가장 급한 공고 기준으로 첨부 색상을 정한다."""
+    urgent = soon = False
+    for j in jobs:
+        d = j.get("d_day")
+        if d is None or j.get("always_open"):
+            continue
+        if d < 0:
+            continue
+        if d <= 3:
+            urgent = True
+        elif d <= 5:
+            soon = True
+    if urgent:
+        return COLOR_URGENT
+    if soon:
+        return COLOR_SOON
+    return COLOR_DEFAULT
+
+
+def _job_meta_line(job: dict) -> str:
+    """회사·지역·유형·마감일을 아이콘과 함께 한 줄(들)로 조합."""
+    bits = []
+    if job.get("company"):
+        bits.append(f"🏢 {job['company']}")
+    if job.get("region"):
+        bits.append(f"📍 {job['region']}")
+    if job.get("job_type"):
+        bits.append(f"🗂️ {job['job_type']}")
+
+    lines = []
+    if bits:
+        lines.append("  ｜  ".join(bits))
+
+    deadline_bits = []
+    if job.get("period"):
+        deadline_bits.append(f"📅 {job['period']}")
+    badge = d_day_badge(job)
+    if badge:
+        deadline_bits.append(badge)
+    if deadline_bits:
+        lines.append("  ｜  ".join(deadline_bits))
+
+    return "\n".join(lines)
+
+
+def _job_card_blocks(job: dict) -> list[dict]:
+    """공고 하나를 표현하는 Block Kit 블록 목록."""
+    text = f"*<{job['url']}|{job['title']}>*"
+    meta = _job_meta_line(job)
+    if meta:
+        text += f"\n{meta}"
+
+    return [{
+        "type": "section",
+        "text": {"type": "mrkdwn", "text": text},
+        "accessory": {
+            "type": "button",
+            "text": {"type": "plain_text", "text": "지원하기 →", "emoji": True},
+            "url": job["url"],
+            "style": "primary",
+        },
+    }]
+
+
+def build_slack_message(new_jobs: list[dict], *, title: str = "") -> dict:
+    now = datetime.now(KST)
+    timestamp = now.strftime("%Y.%m.%d (%a) %H:%M KST")
+    count = len(new_jobs)
+    display_jobs = new_jobs[:MAX_CARDS]
+    hidden = count - len(display_jobs)
+
+    header_text = title or f"📢 하이브레인 신규 채용공고 {count}건"
+
+    blocks: list[dict] = [
         {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": "*📢  하이브레인 신규 채용공고*",
-            },
+            "type": "header",
+            "text": {"type": "plain_text", "text": header_text[:150], "emoji": True},
         },
         {
             "type": "context",
             "elements": [
-                {
-                    "type": "mrkdwn",
-                    "text": f"🏢 하이브레인  ｜  🔔 *{count}건*의 새로운 채용공고",
-                },
+                {"type": "mrkdwn", "text": f"🏢 *하이브레인*  ｜  🔔 새 공고 *{count}건*  ｜  🕒 {timestamp}"},
             ],
         },
         {"type": "divider"},
     ]
 
-    for job in display_jobs:
-        title_line = f"> *<{job['url']}|{job['title']}>*"
-        if job["period"]:
-            title_line += f"\n> 📅 `{job['period']}`"
-
-        blocks.append({
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": title_line},
-            "accessory": {
-                "type": "button",
-                "text": {"type": "plain_text", "text": "지원하기", "emoji": True},
-                "url": job["url"],
-                "style": "primary",
-            },
-        })
+    for i, job in enumerate(display_jobs):
+        blocks.extend(_job_card_blocks(job))
+        if i < len(display_jobs) - 1:
+            blocks.append({"type": "divider"})
 
     blocks.append({"type": "divider"})
+
+    if hidden > 0:
+        blocks.append({
+            "type": "context",
+            "elements": [
+                {"type": "mrkdwn", "text": f"…그 외 *{hidden}건*의 신규 공고가 더 있습니다."},
+            ],
+        })
 
     blocks.append({
         "type": "actions",
         "elements": [
             {
                 "type": "button",
-                "text": {"type": "plain_text", "text": "📋 전체 채용공고 보기", "emoji": True},
+                "text": {"type": "plain_text", "text": "📋 전체 신규 공고 보기", "emoji": True},
                 "url": f"{BASE_URL}/recruitment/recruits?listType=D3NEW",
             },
         ],
     })
 
-    footer_text = f"🤖 HiBrain Job Alert  ｜  {timestamp}"
-    if count > 20:
-        footer_text = f"외 *{count - 20}건* 추가  ｜  " + footer_text
-
     blocks.append({
         "type": "context",
         "elements": [
-            {"type": "mrkdwn", "text": footer_text},
+            {"type": "mrkdwn", "text": "🤖 HiBrain Job Alert · 자동 수집 봇"},
         ],
     })
 
     return {
         "attachments": [
             {
-                "color": "#0054a6",
+                "color": _accent_color(display_jobs),
                 "blocks": blocks,
             }
         ]
@@ -298,8 +475,8 @@ def send_to_slack(message: dict) -> tuple[int, int]:
     """
     webhook_urls = os.environ.get("SLACK_WEBHOOK_URL", "")
     if not webhook_urls:
-        print("SLACK_WEBHOOK_URL 환경변수가 설정되지 않았습니다.")
-        print("Slack 전송을 건너뜁니다.")
+        log("SLACK_WEBHOOK_URL 환경변수가 설정되지 않았습니다.")
+        log("Slack 전송을 건너뜁니다. (아래는 전송하려던 메시지 미리보기)")
         print(json.dumps(message, ensure_ascii=False, indent=2))
         return 0, 0
 
@@ -312,12 +489,12 @@ def send_to_slack(message: dict) -> tuple[int, int]:
         try:
             resp = requests.post(url, json=message, timeout=10)
         except requests.RequestException as e:
-            print(f"Slack {label} 전송 실패 (네트워크 오류): {redact(str(e), url)}")
+            log(f"Slack {label} 전송 실패 (네트워크 오류): {redact(str(e), url)}")
             continue
 
         if resp.ok:
             delivered += 1
-            print(f"Slack {label} 전송 완료!")
+            log(f"Slack {label} 전송 완료!")
             continue
 
         body = redact(resp.text.strip(), url)
@@ -327,9 +504,9 @@ def send_to_slack(message: dict) -> tuple[int, int]:
             warn(detail)
             dead_channels.append(label)
         else:
-            print(detail)
+            log(detail)
 
-    print(f"Slack 전송 결과: {delivered}/{len(urls)} 채널 성공")
+    log(f"Slack 전송 결과: {delivered}/{len(urls)} 채널 성공")
 
     if dead_channels:
         warn(
@@ -340,60 +517,74 @@ def send_to_slack(message: dict) -> tuple[int, int]:
     return delivered, len(urls)
 
 
+def _deliver(message: dict) -> None:
+    """Slack 전송 후 결과에 따라 프로세스 종료 코드를 정한다."""
+    delivered, total = send_to_slack(message)
+    if total and not delivered:
+        log("모든 Slack 채널 전송에 실패했습니다.")
+        sys.exit(1)
+
+
+def run_test_mode(jobs: list[dict]) -> None:
+    sample = jobs[:3]
+    log(f"[테스트 모드] 최근 {len(sample)}개 공고를 샘플로 Slack에 전송합니다.")
+    message = build_slack_message(sample, title=f"🧪 [테스트] 하이브레인 채용공고 {len(sample)}건")
+    message["attachments"][0]["color"] = COLOR_SOON
+    _deliver(message)
+    log(f"테스트 메시지 전송 완료 ({len(sample)}건)")
+
+
 def main():
     test_mode = os.environ.get("TEST_MODE", "").lower() == "true"
 
-    if test_mode:
-        print("[테스트 모드] 최근 3개 공고를 샘플로 Slack에 전송합니다.")
-
-    print("hibrain.net 채용정보 스크래핑 시작...")
-
+    log("hibrain.net 채용정보 스크래핑 시작...")
     jobs = scrape_jobs()
-    print(f"총 {len(jobs)}개 공고 발견")
+    log(f"총 {len(jobs)}개 공고 발견")
 
     if not jobs:
-        print("공고를 가져오지 못했습니다. (다음 주기에 재시도)")
+        log("공고를 가져오지 못했습니다. (다음 주기에 재시도)")
         sys.exit(0)
 
     if test_mode:
-        sample = jobs[:3]
-        message = build_slack_message(sample)
-        message["attachments"][0]["blocks"][0]["text"]["text"] = "*🧪  [테스트] 하이브레인 채용공고 알림*"
-        message["attachments"][0]["color"] = "#f2c744"
-        delivered, total = send_to_slack(message)
-        if total and not delivered:
-            print("모든 Slack 채널 전송에 실패했습니다.")
-            sys.exit(1)
-        print(f"테스트 메시지 전송 완료 ({len(sample)}건)")
+        run_test_mode(jobs)
         return
 
     seen = load_seen()
     seen_set = set(seen)
-
     new_jobs = [j for j in jobs if j["id"] not in seen_set]
-    print(f"신규 공고: {len(new_jobs)}개")
+    log(f"신규 공고: {len(new_jobs)}개")
 
     if not new_jobs:
-        print("새로운 공고가 없습니다.")
+        log("새로운 공고가 없습니다.")
         return
+
+    # 마감 임박 순 → 최신 순으로 정렬해 중요한 공고가 위로 오게 한다.
+    def sort_key(j: dict):
+        d = j.get("d_day")
+        # 상시/마감/파싱불가는 뒤로, 남은 일수가 적을수록 앞으로
+        if j.get("always_open") or d is None or d < 0:
+            return (1, 0)
+        return (0, d)
+
+    new_jobs.sort(key=sort_key)
 
     message = build_slack_message(new_jobs)
     delivered, total = send_to_slack(message)
 
     if total == 0:
-        print("Slack 웹훅이 없어 seen_jobs.json을 갱신하지 않습니다.")
+        log("Slack 웹훅이 없어 seen_jobs.json을 갱신하지 않습니다.")
         return
 
     if delivered == 0:
-        print("모든 Slack 채널 전송에 실패했습니다.")
-        print("seen_jobs.json을 갱신하지 않고 종료합니다. (다음 주기에 재시도)")
+        log("모든 Slack 채널 전송에 실패했습니다.")
+        log("seen_jobs.json을 갱신하지 않고 종료합니다. (다음 주기에 재시도)")
         sys.exit(1)
 
     for job in new_jobs:
         seen.append(job["id"])
     save_seen(seen)
 
-    print(f"seen_jobs.json 업데이트 완료 (총 {len(load_seen())}개)")
+    log(f"seen_jobs.json 업데이트 완료 (총 {len(load_seen())}개)")
 
 
 if __name__ == "__main__":
