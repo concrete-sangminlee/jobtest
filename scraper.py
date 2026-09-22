@@ -260,76 +260,31 @@ def compute_d_day(end_date: str) -> Optional[int]:
 
 # 색상 팔레트 (Slack attachment 좌측 색상 바)
 COLOR_DEFAULT = "#0A66C2"   # 하이브레인 블루
-COLOR_URGENT = "#E01E5A"    # 마감 임박(빨강)
-
-# 한 카테고리에 표시할 최대 공고 수 (초과분은 "+N건 더")
-PER_CATEGORY_LIMIT = _env_int("PER_CATEGORY_LIMIT", 8)
-
-# ─────────────────────────────────────────────────────────────
-# 분류 (카테고리)
-# ─────────────────────────────────────────────────────────────
-# 순서 = Slack에 노출되는 순서. "마감임박"은 코드에서 항상 최상단에 별도 처리.
-CATEGORIES = [
-    ("professor", "🎓 교수·교원"),
-    ("research", "🔬 연구원·박사후"),
-    ("admin", "🏢 행정·직원"),
-    ("etc", "📌 기타"),
-]
-
-# 제목/유형에서 카테고리를 추정할 키워드
-_PROFESSOR_KW = ("교수", "교원", "조교수", "부교수", "정교수", "전임", "초빙", "faculty", "professor")
-_RESEARCH_KW = (
-    "연구원", "박사후", "포닥", "postdoc", "post-doc", "연구교수", "연구조교수",
-    "researcher", "research", "연구직", "선임연구", "책임연구", "위촉연구",
-)
-_ADMIN_KW = (
-    "행정", "직원", "사무", "매니저", "코디네이터", "조교", "간사", "주무관",
-    "전문원", "관리자", "staff", "administrat", "assistant",
-)
+# 한 번에 나열할 최대 공고 수 (초과분은 "…외 N건")
+MAX_LINES = _env_int("SLACK_MAX_LINES", 25)
 
 
-def _classify(job: dict) -> str:
-    """공고를 카테고리 키로 분류한다. (마감임박은 여기서 다루지 않음)"""
-    haystack = f"{job.get('job_type','')} {job.get('title','')}".lower()
-
-    def has(words):
-        return any(w.lower() in haystack for w in words)
-
-    # 교수 우선(연구교수는 연구로 가도록 교수 키워드에서 '연구교수' 제외 판단)
-    if has(_PROFESSOR_KW) and "연구교수" not in haystack and "연구조교수" not in haystack:
-        return "professor"
-    if has(_RESEARCH_KW):
-        return "research"
-    if has(_ADMIN_KW):
-        return "admin"
-    return "etc"
+def _short_date(end: str) -> str:
+    """'YYYY.MM.DD' → 'MM.DD'. 실패 시 원문."""
+    m = re.search(r"\d{4}\D+(\d{1,2})\D+(\d{1,2})", end or "")
+    return f"{int(m.group(1)):02d}.{int(m.group(2)):02d}" if m else (end or "")
 
 
-def _is_urgent(job: dict) -> bool:
+def _deadline_tag(job: dict) -> str:
+    """마감 표기. 예: 'D-2' / '~10.05' / '상시'."""
     if job.get("always_open"):
-        return False
+        return "상시"
     d = job.get("d_day")
-    return d is not None and 0 <= d <= 3
-
-
-def categorize(jobs: list[dict]) -> tuple[list[dict], dict]:
-    """(마감임박 목록, {카테고리키: [공고...]}) 를 반환한다.
-
-    - 마감임박(D-3 이내)은 카테고리와 무관하게 최상단 그룹으로 뽑는다.
-    - 마감임박이 아닌 공고만 일반 카테고리로 분류한다.
-    - 각 그룹은 마감 임박 순으로 정렬한다.
-    """
-    urgent = [j for j in jobs if _is_urgent(j)]
-    rest = [j for j in jobs if not _is_urgent(j)]
-
-    buckets: dict = {key: [] for key, _ in CATEGORIES}
-    for j in rest:
-        buckets[_classify(j)].append(j)
-
-    urgent.sort(key=_sort_key)
-    for key in buckets:
-        buckets[key].sort(key=_sort_key)
-    return urgent, buckets
+    short = _short_date(job.get("end_date", ""))
+    if d is None:
+        return short or "미정"
+    if d < 0:
+        return "마감"
+    if d == 0:
+        return "D-DAY"
+    if d <= 7:
+        return f"D-{d}"
+    return f"~{short}" if short else f"D-{d}"
 
 
 def _sort_key(j: dict):
@@ -340,141 +295,67 @@ def _sort_key(j: dict):
     return (0, d)
 
 
-def _deadline_tag(job: dict) -> str:
-    """공고 한 줄에 붙일 마감 표기. 예: 'D-2' / '~10.05' / '상시'."""
-    if job.get("always_open"):
-        return "상시"
-    d = job.get("d_day")
-    end = job.get("end_date") or ""
-    # end_date 'YYYY.MM.DD' → 'MM.DD'
-    short = ""
-    m = re.search(r"\d{4}\D+(\d{1,2})\D+(\d{1,2})", end)
-    if m:
-        short = f"{int(m.group(1)):02d}.{int(m.group(2)):02d}"
-    if d is None:
-        return short or "미정"
-    if d < 0:
-        return "마감"
-    if d == 0:
-        return "D-DAY"
-    if d <= 7:
-        return f"D-{d}" + (f"·{short}" if short else "")
-    return f"~{short}" if short else f"D-{d}"
-
-
-def _job_line(job: dict, *, urgent: bool = False) -> str:
-    """공고 1건을 한 줄 mrkdwn으로. 제목이 지원 링크가 된다."""
-    title = _truncate(job.get("title", "(제목 없음)"), 80)
-    url = job.get("url", "")
-    head = f"<{url}|{title}>" if url else title
-
-    meta = []
-    if job.get("company"):
-        meta.append(_truncate(job["company"], 24))
-    if job.get("region"):
-        meta.append(_truncate(job["region"], 12))
-    tag = _deadline_tag(job)
-    if tag:
-        meta.append(f"*{tag}*" if urgent else tag)
-
-    meta_str = "  ·  ".join(meta)
-    bullet = "🔴" if urgent else "•"
-    return f"{bullet} {head}" + (f"\n    {meta_str}" if meta_str else "")
-
-
 def _truncate(text: str, limit: int) -> str:
     text = text or ""
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
-def _section(text: str) -> dict:
-    return {"type": "section", "text": {"type": "mrkdwn", "text": text[:2900]}}
+def _job_line(job: dict) -> str:
+    """공고 1건 = 한 줄. 제목이 지원 링크, 뒤에 기관·지역·마감."""
+    title = _truncate(job.get("title", "(제목 없음)"), 70)
+    url = job.get("url", "")
+    head = f"<{url}|{title}>" if url else title
 
+    meta = []
+    if job.get("company"):
+        meta.append(_truncate(job["company"], 20))
+    if job.get("region"):
+        meta.append(_truncate(job["region"], 10))
+    meta.append(_deadline_tag(job))
 
-def _group_blocks(heading: str, jobs: list[dict], *, urgent: bool = False) -> list[dict]:
-    """한 그룹(헤딩 + 공고 줄들)을 Slack 블록 목록으로. Slack 3000자 제한 대비 청크 분할."""
-    if not jobs:
-        return []
-    shown = jobs[:PER_CATEGORY_LIMIT]
-    extra = len(jobs) - len(shown)
-
-    lines = [_job_line(j, urgent=urgent) for j in shown]
-    if extra > 0:
-        lines.append(f"_+{extra}건 더_")
-
-    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": f"*{heading}  ({len(jobs)})*"}}]
-
-    # 공고 줄들을 2900자 이하 청크로 묶어 section 추가
-    chunk = ""
-    for line in lines:
-        piece = ("\n" if chunk else "") + line
-        if len(chunk) + len(piece) > 2900:
-            blocks.append(_section(chunk))
-            chunk = line
-        else:
-            chunk += piece
-    if chunk:
-        blocks.append(_section(chunk))
-    return blocks
+    return f"• {head}  ·  `{'  ·  '.join(meta)}`"
 
 
 def build_slack_message(new_jobs: list[dict], *, title: str = "") -> dict:
     now = datetime.now(KST)
-    timestamp = now.strftime("%Y.%m.%d (%a) %H:%M")
+    timestamp = now.strftime("%m.%d %H:%M")
     count = len(new_jobs)
 
-    urgent, buckets = categorize(new_jobs)
+    jobs = sorted(new_jobs, key=_sort_key)
+    shown = jobs[:MAX_LINES]
+    hidden = count - len(shown)
 
-    header_text = title or f"📢 하이브레인 신규 채용 {count}건"
-    summary = f"🔔 새 공고 *{count}건*"
-    if urgent:
-        summary += f"   ·   🔴 마감임박 *{len(urgent)}건*"
-    summary += f"   ·   🕒 {timestamp} KST"
+    header = title or f"하이브레인 신규 채용 {count}건"
+
+    lines = [_job_line(j) for j in shown]
+    if hidden > 0:
+        lines.append(f"…외 {hidden}건")
+
+    # Slack 3000자 제한 대비: 줄들을 청크로 나눠 section 여러 개로.
+    sections, chunk = [], ""
+    for line in lines:
+        piece = ("\n" if chunk else "") + line
+        if len(chunk) + len(piece) > 2900:
+            sections.append(chunk)
+            chunk = line
+        else:
+            chunk += piece
+    if chunk:
+        sections.append(chunk)
 
     blocks: list[dict] = [
-        {"type": "header", "text": {"type": "plain_text", "text": header_text[:150], "emoji": True}},
-        {"type": "context", "elements": [{"type": "mrkdwn", "text": summary}]},
+        {"type": "header", "text": {"type": "plain_text", "text": header[:150], "emoji": True}},
+        {"type": "context", "elements": [{"type": "mrkdwn",
+            "text": f"{timestamp} · <{BASE_URL}/recruitment/recruits?listType=D3NEW|전체 보기>"}]},
         {"type": "divider"},
     ]
+    for text in sections:
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": text}})
 
-    if urgent:
-        blocks.extend(_group_blocks("🔴 마감임박", urgent, urgent=True))
-        blocks.append({"type": "divider"})
-
-    first = True
-    for key, label in CATEGORIES:
-        group = buckets.get(key, [])
-        if not group:
-            continue
-        if not first:
-            blocks.append({"type": "divider"})
-        blocks.extend(_group_blocks(label, group))
-        first = False
-
-    blocks.append({"type": "divider"})
-    blocks.append({
-        "type": "actions",
-        "elements": [{
-            "type": "button",
-            "text": {"type": "plain_text", "text": "📋 전체 신규 공고 보기", "emoji": True},
-            "url": f"{BASE_URL}/recruitment/recruits?listType=D3NEW",
-            "style": "primary",
-        }],
-    })
-    blocks.append({
-        "type": "context",
-        "elements": [{"type": "mrkdwn", "text": "HiBrain Job Alert · 자동 수집 봇"}],
-    })
-
-    # Slack: 첨부당 최대 50블록. 초과 시 잘라내고 안내.
     if len(blocks) > 50:
-        blocks = blocks[:48]
-        blocks.append({"type": "divider"})
-        blocks.append({"type": "context", "elements": [
-            {"type": "mrkdwn", "text": "…일부 항목은 생략되었습니다. 전체 보기에서 확인하세요."}]})
+        blocks = blocks[:50]
 
-    color = COLOR_URGENT if urgent else COLOR_DEFAULT
-    return {"attachments": [{"color": color, "blocks": blocks}]}
+    return {"attachments": [{"color": COLOR_DEFAULT, "blocks": blocks}]}
 
 
 def webhook_label(url: str) -> str:
