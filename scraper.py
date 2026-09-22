@@ -555,27 +555,27 @@ def send_to_slack(message: dict) -> tuple[int, int]:
 # 이미지 카드 렌더링 + Slack 파일 업로드
 # ─────────────────────────────────────────────────────────────
 
-def render_card(jobs: list[dict], subtitle: str) -> Optional[str]:
-    """공고를 이미지 카드(PNG)로 렌더링하고 파일 경로를 반환한다.
+def render_cards(jobs: list[dict]) -> list[str]:
+    """공고들을 개별 상품 카드(PNG)로 렌더링해 경로 목록을 반환한다.
 
-    Playwright/Chromium이 없거나 렌더링에 실패하면 None을 반환해
+    Playwright/Chromium이 없거나 렌더링에 실패하면 빈 리스트를 반환해
     호출 측이 텍스트(Block Kit) 방식으로 폴백할 수 있게 한다.
     """
     try:
         import card_renderer
     except Exception as e:
         log(f"카드 렌더러를 불러올 수 없습니다: {e}")
-        return None
+        return []
 
-    out_path = str(Path(__file__).parent / "job_card.png")
+    out_dir = str(Path(__file__).parent / "cards")
     try:
-        card_renderer.render_card_png(jobs, out_path, subtitle=subtitle, max_rows=CARD_ROWS)
+        paths = card_renderer.render_cards(jobs, out_dir)
     except Exception as e:
         log(f"이미지 카드 렌더링 실패 (텍스트 방식으로 폴백): {type(e).__name__}: {e}")
-        return None
+        return []
 
-    log(f"이미지 카드 렌더링 완료: {out_path}")
-    return out_path
+    log(f"이미지 카드 {len(paths)}장 렌더링 완료")
+    return paths
 
 
 def _slack_api(method: str, token: str, **kwargs) -> dict:
@@ -589,84 +589,97 @@ def _slack_api(method: str, token: str, **kwargs) -> dict:
         return {"ok": False, "error": f"non_json_response_{resp.status_code}"}
 
 
-def upload_image_to_slack(image_path: str, title: str, comment: str) -> tuple[int, int]:
-    """이미지를 Slack 채널에 업로드한다. (성공 채널 수, 대상 채널 수) 반환.
-
-    최신 external-upload 흐름을 사용한다:
-      1) files.getUploadURLExternal 로 업로드 URL 발급
-      2) 발급된 URL로 파일 바이트 POST
-      3) files.completeUploadExternal 로 채널에 게시
-
-    SLACK_BOT_TOKEN 과 SLACK_CHANNEL_IDS(콤마 구분)가 있어야 동작한다.
-    설정이 없으면 (0, 0)을 반환해 웹훅 방식으로 폴백하게 한다.
-    """
-    token = os.environ.get("SLACK_BOT_TOKEN", "").strip()
-    channels = [c.strip() for c in os.environ.get("SLACK_CHANNEL_IDS", "").split(",") if c.strip()]
-    if not token or not channels:
-        return 0, 0
-
+def _upload_one_file(path: str, token: str, title: str) -> Optional[str]:
+    """파일 1개를 Slack에 업로드하고 file_id를 반환. 실패 시 None."""
     try:
-        size = os.path.getsize(image_path)
-        filename = os.path.basename(image_path)
+        size = os.path.getsize(path)
+        filename = os.path.basename(path)
     except OSError as e:
         log(f"이미지 파일을 읽을 수 없습니다: {e}")
-        return 0, len(channels)
+        return None
 
-    # 1) 업로드 URL 발급
     info = _slack_api(
         "files.getUploadURLExternal", token,
         data={"filename": filename, "length": str(size)},
     )
     if not info.get("ok"):
-        log(f"Slack 업로드 URL 발급 실패: {info.get('error')}")
-        return 0, len(channels)
+        log(f"Slack 업로드 URL 발급 실패({filename}): {info.get('error')}")
+        return None
 
-    upload_url = info["upload_url"]
-    file_id = info["file_id"]
-
-    # 2) 파일 바이트 전송
     try:
-        with open(image_path, "rb") as f:
-            up = requests.post(upload_url, files={"file": (filename, f, "image/png")}, timeout=60)
+        with open(path, "rb") as f:
+            up = requests.post(info["upload_url"], files={"file": (filename, f, "image/png")}, timeout=60)
         if not up.ok:
-            log(f"Slack 파일 업로드 실패: HTTP {up.status_code}")
-            return 0, len(channels)
+            log(f"Slack 파일 업로드 실패({filename}): HTTP {up.status_code}")
+            return None
     except requests.RequestException as e:
-        log(f"Slack 파일 업로드 네트워크 오류: {e}")
+        log(f"Slack 파일 업로드 네트워크 오류({filename}): {e}")
+        return None
+
+    return info["file_id"]
+
+
+def upload_cards_to_slack(image_paths: list[str], titles: list[str], comment: str) -> tuple[int, int]:
+    """여러 카드 이미지를 한 메시지로 Slack 채널들에 게시한다(갤러리).
+
+    최신 external-upload 흐름:
+      1) 각 파일마다 files.getUploadURLExternal → 바이트 업로드
+      2) files.completeUploadExternal 를 files 배열로 한 번 호출 → 갤러리로 표시
+
+    SLACK_BOT_TOKEN + SLACK_CHANNEL_IDS 가 없으면 (0, 0)을 반환해 폴백하게 한다.
+    """
+    token = os.environ.get("SLACK_BOT_TOKEN", "").strip()
+    channels = [c.strip() for c in os.environ.get("SLACK_CHANNEL_IDS", "").split(",") if c.strip()]
+    if not token or not channels:
+        return 0, 0
+    if not image_paths:
         return 0, len(channels)
 
-    # 3) 채널별로 게시
+    # 1) 모든 파일 업로드 → file_id 수집
+    files_meta = []
+    for path, title in zip(image_paths, titles):
+        file_id = _upload_one_file(path, token, title)
+        if file_id:
+            files_meta.append({"id": file_id, "title": title})
+
+    if not files_meta:
+        log("업로드된 카드가 없어 이미지 게시를 건너뜁니다.")
+        return 0, len(channels)
+
+    # 2) 채널별로 한 번에 게시 (files 배열 → 갤러리)
     import json as _json
     delivered = 0
     for ch in channels:
         res = _slack_api(
             "files.completeUploadExternal", token,
             data={
-                "files": _json.dumps([{"id": file_id, "title": title}]),
+                "files": _json.dumps(files_meta),
                 "channel_id": ch,
                 "initial_comment": comment,
             },
         )
         if res.get("ok"):
             delivered += 1
-            log(f"Slack 채널 {ch} 이미지 게시 완료!")
+            log(f"Slack 채널 {ch} 카드 {len(files_meta)}장 게시 완료!")
         else:
-            log(f"Slack 채널 {ch} 이미지 게시 실패: {res.get('error')}")
+            log(f"Slack 채널 {ch} 카드 게시 실패: {res.get('error')}")
 
     log(f"Slack 이미지 전송 결과: {delivered}/{len(channels)} 채널 성공")
     return delivered, len(channels)
 
 
 def deliver_jobs(jobs: list[dict], *, subtitle: str, comment: str) -> tuple[int, int]:
-    """공고를 Slack에 전달한다. 이미지 카드를 우선 시도하고, 불가하면 Block Kit로 폴백.
+    """공고를 Slack에 전달한다. 상품 카드 갤러리를 우선 시도하고, 불가하면 Block Kit로 폴백.
 
     반환: (성공 채널 수, 대상 채널 수). 이미지/웹훅 중 실제 사용된 경로 기준.
     """
     # 봇 토큰 + 채널이 설정된 경우에만 이미지 카드 경로를 시도
     if os.environ.get("SLACK_BOT_TOKEN", "").strip() and os.environ.get("SLACK_CHANNEL_IDS", "").strip():
-        image_path = render_card(jobs, subtitle)
-        if image_path:
-            delivered, total = upload_image_to_slack(image_path, title=subtitle, comment=comment)
+        card_jobs = jobs[:CARD_ROWS]
+        paths = render_cards(card_jobs)
+        if paths:
+            titles = [j.get("title", "채용공고") for j in card_jobs]
+            delivered, total = upload_cards_to_slack(paths, titles, comment=comment)
             if delivered > 0:
                 return delivered, total
             log("이미지 전송이 실패하여 텍스트(Block Kit) 방식으로 폴백합니다.")
