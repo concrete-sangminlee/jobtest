@@ -2,9 +2,11 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime, timezone, timedelta
 from html import unescape
 from pathlib import Path
+from typing import Optional
 from urllib.parse import quote
 
 import requests
@@ -14,6 +16,21 @@ BASE_URL = "https://hibrain.net"
 LIST_URL = f"{BASE_URL}/recruitment/recruits?listType=D3NEW&pagesize=50&sortType=SORTDTM"
 SEEN_FILE = Path(__file__).parent / "seen_jobs.json"
 MAX_SEEN = 500
+
+# 네트워크 튜닝
+MAX_ATTEMPTS = 3           # 각 방식(ScraperAPI/직접)당 최대 시도 횟수
+BACKOFF_BASE = 3           # 재시도 대기 시간(초) = BACKOFF_BASE * 시도횟수
+SCRAPERAPI_TIMEOUT = 70    # ScraperAPI는 프록시/렌더링으로 느릴 수 있어 넉넉히
+DIRECT_TIMEOUT = 30
+
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+}
 
 
 def load_seen() -> list[str]:
@@ -32,19 +49,74 @@ def extract_job_id(href: str) -> str:
     return match.group(1) if match else ""
 
 
-def fetch_page() -> str:
-    scraper_api_key = os.environ.get("SCRAPER_API_KEY")
-    if scraper_api_key:
-        print("ScraperAPI를 통해 페이지 가져오는 중...")
-        url = f"http://api.scraperapi.com?api_key={scraper_api_key}&url={quote(LIST_URL)}"
-        resp = requests.get(url, timeout=60)
-    else:
-        print("직접 요청으로 페이지 가져오는 중...")
-        resp = requests.get(LIST_URL, headers={
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        }, timeout=30)
+def _looks_like_job_list(html: str) -> bool:
+    """응답이 실제 채용 목록 페이지인지 최소 검증. (차단 페이지/빈 응답 거르기)"""
+    return bool(html) and 'id="articleList"' in html
+
+
+def _fetch_via_scraperapi(api_key: str) -> str:
+    # HTTPS 엔드포인트를 사용해 프록시 구간 신뢰성을 높인다.
+    url = (
+        "https://api.scraperapi.com/"
+        f"?api_key={api_key}&url={quote(LIST_URL)}"
+    )
+    resp = requests.get(url, timeout=SCRAPERAPI_TIMEOUT)
     resp.raise_for_status()
     return resp.text
+
+
+def _fetch_direct() -> str:
+    resp = requests.get(LIST_URL, headers=BROWSER_HEADERS, timeout=DIRECT_TIMEOUT)
+    resp.raise_for_status()
+    return resp.text
+
+
+def _try_method(name: str, fetch_fn) -> Optional[str]:
+    """한 가지 방식(ScraperAPI 또는 직접)을 재시도와 함께 실행한다.
+
+    성공적으로 채용 목록으로 보이는 HTML을 얻으면 반환하고,
+    모든 시도가 실패하면 None을 반환한다.
+    """
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            print(f"{name} 시도 {attempt}/{MAX_ATTEMPTS}...")
+            html = fetch_fn()
+        except requests.RequestException as e:
+            print(f"  {name} 실패: {type(e).__name__}: {e}")
+        else:
+            if _looks_like_job_list(html):
+                print(f"  {name} 성공")
+                return html
+            print(f"  {name} 응답에 채용 목록이 없습니다. (차단/빈 응답 가능성)")
+
+        if attempt < MAX_ATTEMPTS:
+            wait = BACKOFF_BASE * attempt
+            print(f"  {wait}초 후 재시도...")
+            time.sleep(wait)
+
+    print(f"{name} 최종 실패")
+    return None
+
+
+def fetch_page() -> str:
+    """채용 목록 HTML을 가져온다.
+
+    ScraperAPI 키가 있으면 먼저 시도(재시도 포함)하고,
+    실패하면 직접 요청으로 폴백한다. 모두 실패하면 예외를 던진다.
+    """
+    scraper_api_key = os.environ.get("SCRAPER_API_KEY")
+
+    if scraper_api_key:
+        html = _try_method("ScraperAPI", lambda: _fetch_via_scraperapi(scraper_api_key))
+        if html is not None:
+            return html
+        print("ScraperAPI가 실패하여 직접 요청으로 폴백합니다.")
+
+    html = _try_method("직접 요청", _fetch_direct)
+    if html is not None:
+        return html
+
+    raise RuntimeError("모든 방식으로 페이지를 가져오지 못했습니다.")
 
 
 def scrape_jobs() -> list[dict]:
@@ -186,6 +258,7 @@ SLACK_ERROR_HINTS = {
     "channel_is_archived": "채널이 아카이브되었습니다. 채널을 복구하거나 SLACK_WEBHOOK_URL에서 이 웹훅을 제거하세요.",
     "channel_not_found": "채널을 찾을 수 없습니다. 공개→비공개 전환 후 앱이 채널에서 빠졌을 수 있습니다. 해당 채널에 앱을 다시 초대하세요.",
     "no_service": "웹훅이 삭제되었습니다. Slack 앱 설정에서 새로 발급받아 SLACK_WEBHOOK_URL을 갱신하세요.",
+    "no_active_hooks": "이 웹훅에 연결된 활성 훅이 없습니다. 웹훅이 폐기되었으니 SLACK_WEBHOOK_URL에서 제거하거나 새 웹훅으로 교체하세요.",
     "no_team": "워크스페이스에서 앱이 제거되었습니다. 앱을 다시 설치하세요.",
     "invalid_token": "웹훅 토큰이 유효하지 않습니다. 새로 발급받아 SLACK_WEBHOOK_URL을 갱신하세요.",
     "action_prohibited": "워크스페이스 관리 정책으로 이 웹훅이 차단되었습니다.",
@@ -232,6 +305,7 @@ def send_to_slack(message: dict) -> tuple[int, int]:
 
     urls = [u.strip() for u in webhook_urls.split(",") if u.strip()]
     delivered = 0
+    dead_channels = []
 
     for i, url in enumerate(urls, 1):
         label = f"채널 {i} ({webhook_label(url)})"
@@ -251,10 +325,18 @@ def send_to_slack(message: dict) -> tuple[int, int]:
         detail = f"Slack {label} 전송 실패: HTTP {resp.status_code} {body} — {hint}"
         if permanent:
             warn(detail)
+            dead_channels.append(label)
         else:
             print(detail)
 
     print(f"Slack 전송 결과: {delivered}/{len(urls)} 채널 성공")
+
+    if dead_channels:
+        warn(
+            f"영구적으로 실패하는 웹훅 {len(dead_channels)}개: {', '.join(dead_channels)}. "
+            "SLACK_WEBHOOK_URL 시크릿에서 제거하거나 새 웹훅으로 교체하세요."
+        )
+
     return delivered, len(urls)
 
 
