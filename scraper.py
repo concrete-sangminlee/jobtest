@@ -37,12 +37,6 @@ BACKOFF_BASE = _env_int("FETCH_BACKOFF_BASE", 3)      # 재시도 대기(초) = 
 SCRAPERAPI_TIMEOUT = _env_int("SCRAPERAPI_TIMEOUT", 70)  # ScraperAPI는 프록시/렌더링으로 느릴 수 있어 넉넉히
 DIRECT_TIMEOUT = _env_int("DIRECT_TIMEOUT", 30)
 
-# Slack 메시지에 카드로 표시할 최대 공고 수 (나머지는 "외 N건"으로 요약)
-MAX_CARDS = _env_int("SLACK_MAX_CARDS", 15)
-
-# 이미지 카드에 표시할 공고 행 수
-CARD_ROWS = _env_int("CARD_ROWS", 8)
-
 BROWSER_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -267,56 +261,125 @@ def compute_d_day(end_date: str) -> Optional[int]:
 # 색상 팔레트 (Slack attachment 좌측 색상 바)
 COLOR_DEFAULT = "#0A66C2"   # 하이브레인 블루
 COLOR_URGENT = "#E01E5A"    # 마감 임박(빨강)
-COLOR_SOON = "#ECB22E"      # 마감 임박 직전(노랑)
 
-# 원형 숫자 (①~⑳) — 카드 번호를 깔끔하게 표시
-_CIRCLED = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
+# 한 카테고리에 표시할 최대 공고 수 (초과분은 "+N건 더")
+PER_CATEGORY_LIMIT = _env_int("PER_CATEGORY_LIMIT", 8)
+
+# ─────────────────────────────────────────────────────────────
+# 분류 (카테고리)
+# ─────────────────────────────────────────────────────────────
+# 순서 = Slack에 노출되는 순서. "마감임박"은 코드에서 항상 최상단에 별도 처리.
+CATEGORIES = [
+    ("professor", "🎓 교수·교원"),
+    ("research", "🔬 연구원·박사후"),
+    ("admin", "🏢 행정·직원"),
+    ("etc", "📌 기타"),
+]
+
+# 제목/유형에서 카테고리를 추정할 키워드
+_PROFESSOR_KW = ("교수", "교원", "조교수", "부교수", "정교수", "전임", "초빙", "faculty", "professor")
+_RESEARCH_KW = (
+    "연구원", "박사후", "포닥", "postdoc", "post-doc", "연구교수", "연구조교수",
+    "researcher", "research", "연구직", "선임연구", "책임연구", "위촉연구",
+)
+_ADMIN_KW = (
+    "행정", "직원", "사무", "매니저", "코디네이터", "조교", "간사", "주무관",
+    "전문원", "관리자", "staff", "administrat", "assistant",
+)
 
 
-def _circled(n: int) -> str:
-    return _CIRCLED[n - 1] if 1 <= n <= len(_CIRCLED) else f"{n}."
+def _classify(job: dict) -> str:
+    """공고를 카테고리 키로 분류한다. (마감임박은 여기서 다루지 않음)"""
+    haystack = f"{job.get('job_type','')} {job.get('title','')}".lower()
+
+    def has(words):
+        return any(w.lower() in haystack for w in words)
+
+    # 교수 우선(연구교수는 연구로 가도록 교수 키워드에서 '연구교수' 제외 판단)
+    if has(_PROFESSOR_KW) and "연구교수" not in haystack and "연구조교수" not in haystack:
+        return "professor"
+    if has(_RESEARCH_KW):
+        return "research"
+    if has(_ADMIN_KW):
+        return "admin"
+    return "etc"
 
 
-def d_day_status(job: dict) -> tuple[str, str]:
-    """(상태 이모지, 마감 표기) 튜플을 반환한다.
-
-    이모지는 카드 제목 앞에 붙여 한눈에 긴급도를 보여주고,
-    표기는 필드에 들어갈 사람 친화적 문자열이다.
-    """
+def _is_urgent(job: dict) -> bool:
     if job.get("always_open"):
-        return "🟦", "상시채용"
+        return False
     d = job.get("d_day")
+    return d is not None and 0 <= d <= 3
+
+
+def categorize(jobs: list[dict]) -> tuple[list[dict], dict]:
+    """(마감임박 목록, {카테고리키: [공고...]}) 를 반환한다.
+
+    - 마감임박(D-3 이내)은 카테고리와 무관하게 최상단 그룹으로 뽑는다.
+    - 마감임박이 아닌 공고만 일반 카테고리로 분류한다.
+    - 각 그룹은 마감 임박 순으로 정렬한다.
+    """
+    urgent = [j for j in jobs if _is_urgent(j)]
+    rest = [j for j in jobs if not _is_urgent(j)]
+
+    buckets: dict = {key: [] for key, _ in CATEGORIES}
+    for j in rest:
+        buckets[_classify(j)].append(j)
+
+    urgent.sort(key=_sort_key)
+    for key in buckets:
+        buckets[key].sort(key=_sort_key)
+    return urgent, buckets
+
+
+def _sort_key(j: dict):
+    """마감 임박 순 → 상시/미정/마감은 뒤로."""
+    d = j.get("d_day")
+    if j.get("always_open") or d is None or d < 0:
+        return (1, 10 ** 6)
+    return (0, d)
+
+
+def _deadline_tag(job: dict) -> str:
+    """공고 한 줄에 붙일 마감 표기. 예: 'D-2' / '~10.05' / '상시'."""
+    if job.get("always_open"):
+        return "상시"
+    d = job.get("d_day")
+    end = job.get("end_date") or ""
+    # end_date 'YYYY.MM.DD' → 'MM.DD'
+    short = ""
+    m = re.search(r"\d{4}\D+(\d{1,2})\D+(\d{1,2})", end)
+    if m:
+        short = f"{int(m.group(1)):02d}.{int(m.group(2)):02d}"
     if d is None:
-        return "⬜", "상시/미정"
+        return short or "미정"
     if d < 0:
-        return "⬛", "마감"
+        return "마감"
     if d == 0:
-        return "🟥", "오늘 마감 (D-DAY)"
-    if d <= 3:
-        return "🟥", f"D-{d} · 마감임박"
+        return "D-DAY"
     if d <= 7:
-        return "🟨", f"D-{d}"
-    return "🟩", f"D-{d}"
+        return f"D-{d}" + (f"·{short}" if short else "")
+    return f"~{short}" if short else f"D-{d}"
 
 
-def _accent_color(jobs: list[dict]) -> str:
-    """가장 급한 공고 기준으로 첨부 색상을 정한다."""
-    urgent = soon = False
-    for j in jobs:
-        if j.get("always_open"):
-            continue
-        d = j.get("d_day")
-        if d is None or d < 0:
-            continue
-        if d <= 3:
-            urgent = True
-        elif d <= 5:
-            soon = True
-    if urgent:
-        return COLOR_URGENT
-    if soon:
-        return COLOR_SOON
-    return COLOR_DEFAULT
+def _job_line(job: dict, *, urgent: bool = False) -> str:
+    """공고 1건을 한 줄 mrkdwn으로. 제목이 지원 링크가 된다."""
+    title = _truncate(job.get("title", "(제목 없음)"), 80)
+    url = job.get("url", "")
+    head = f"<{url}|{title}>" if url else title
+
+    meta = []
+    if job.get("company"):
+        meta.append(_truncate(job["company"], 24))
+    if job.get("region"):
+        meta.append(_truncate(job["region"], 12))
+    tag = _deadline_tag(job)
+    if tag:
+        meta.append(f"*{tag}*" if urgent else tag)
+
+    meta_str = "  ·  ".join(meta)
+    bullet = "🔴" if urgent else "•"
+    return f"{bullet} {head}" + (f"\n    {meta_str}" if meta_str else "")
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -324,130 +387,94 @@ def _truncate(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
-def _job_card_blocks(job: dict, index: int) -> list[dict]:
-    """공고 하나를 표현하는 Block Kit 블록 목록.
+def _section(text: str) -> dict:
+    return {"type": "section", "text": {"type": "mrkdwn", "text": text[:2900]}}
 
-    - 제목: 번호 + 상태 이모지 + 링크 (굵게)
-    - 필드: 회사 / 지역 / 직종 / 마감 을 2열 정렬로 표기
-    - 우측 '지원' 버튼
-    """
-    emoji, deadline_label = d_day_status(job)
-    title = _truncate(job.get("title", "(제목 없음)"), 120)
-    url = job.get("url", "")
-    heading = f"{_circled(index)} {emoji}  *<{url}|{title}>*" if url else f"{_circled(index)} {emoji}  *{title}*"
 
-    section = {
-        "type": "section",
-        "text": {"type": "mrkdwn", "text": heading},
-    }
-    if url:
-        section["accessory"] = {
-            "type": "button",
-            "text": {"type": "plain_text", "text": "지원", "emoji": True},
-            "url": url,
-            "style": "primary",
-        }
+def _group_blocks(heading: str, jobs: list[dict], *, urgent: bool = False) -> list[dict]:
+    """한 그룹(헤딩 + 공고 줄들)을 Slack 블록 목록으로. Slack 3000자 제한 대비 청크 분할."""
+    if not jobs:
+        return []
+    shown = jobs[:PER_CATEGORY_LIMIT]
+    extra = len(jobs) - len(shown)
 
-    # 2열 필드 (있는 항목만) — Slack은 필드 최대 10개, 각 2000자
-    fields = []
-    if job.get("company"):
-        fields.append(f"*🏢 기관*\n{_truncate(job['company'], 60)}")
-    if job.get("region"):
-        fields.append(f"*📍 지역*\n{_truncate(job['region'], 40)}")
-    if job.get("job_type"):
-        fields.append(f"*🗂 유형*\n{_truncate(job['job_type'], 40)}")
-    if deadline_label:
-        deadline_val = deadline_label
-        if job.get("end_date"):
-            deadline_val = f"{deadline_label}\n{job['end_date']}"
-        fields.append(f"*⏳ 마감*\n{deadline_val}")
+    lines = [_job_line(j, urgent=urgent) for j in shown]
+    if extra > 0:
+        lines.append(f"_+{extra}건 더_")
 
-    if fields:
-        section["fields"] = [{"type": "mrkdwn", "text": f} for f in fields[:10]]
+    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": f"*{heading}  ({len(jobs)})*"}}]
 
-    return [section]
+    # 공고 줄들을 2900자 이하 청크로 묶어 section 추가
+    chunk = ""
+    for line in lines:
+        piece = ("\n" if chunk else "") + line
+        if len(chunk) + len(piece) > 2900:
+            blocks.append(_section(chunk))
+            chunk = line
+        else:
+            chunk += piece
+    if chunk:
+        blocks.append(_section(chunk))
+    return blocks
 
 
 def build_slack_message(new_jobs: list[dict], *, title: str = "") -> dict:
     now = datetime.now(KST)
     timestamp = now.strftime("%Y.%m.%d (%a) %H:%M")
     count = len(new_jobs)
-    display_jobs = new_jobs[:MAX_CARDS]
-    hidden = count - len(display_jobs)
 
-    # 긴급(마감 D-3 이내) 건수 집계 — 상단 요약에 노출
-    urgent_count = sum(
-        1
-        for j in display_jobs
-        if not j.get("always_open")
-        and j.get("d_day") is not None
-        and 0 <= j["d_day"] <= 3
-    )
+    urgent, buckets = categorize(new_jobs)
 
     header_text = title or f"📢 하이브레인 신규 채용 {count}건"
-
-    summary = f"🔔  새 공고 *{count}건*"
-    if urgent_count:
-        summary += f"   ·   🔴 마감임박 *{urgent_count}건*"
+    summary = f"🔔 새 공고 *{count}건*"
+    if urgent:
+        summary += f"   ·   🔴 마감임박 *{len(urgent)}건*"
     summary += f"   ·   🕒 {timestamp} KST"
 
     blocks: list[dict] = [
-        {
-            "type": "header",
-            "text": {"type": "plain_text", "text": header_text[:150], "emoji": True},
-        },
-        {
-            "type": "context",
-            "elements": [
-                {"type": "mrkdwn", "text": summary},
-            ],
-        },
+        {"type": "header", "text": {"type": "plain_text", "text": header_text[:150], "emoji": True}},
+        {"type": "context", "elements": [{"type": "mrkdwn", "text": summary}]},
         {"type": "divider"},
     ]
 
-    for i, job in enumerate(display_jobs, start=1):
-        blocks.extend(_job_card_blocks(job, i))
+    if urgent:
+        blocks.extend(_group_blocks("🔴 마감임박", urgent, urgent=True))
+        blocks.append({"type": "divider"})
 
-    if hidden > 0:
-        blocks.append({
-            "type": "context",
-            "elements": [
-                {"type": "mrkdwn", "text": f"➕  그 외 *{hidden}건*의 신규 공고가 더 있습니다."},
-            ],
-        })
+    first = True
+    for key, label in CATEGORIES:
+        group = buckets.get(key, [])
+        if not group:
+            continue
+        if not first:
+            blocks.append({"type": "divider"})
+        blocks.extend(_group_blocks(label, group))
+        first = False
 
     blocks.append({"type": "divider"})
     blocks.append({
         "type": "actions",
-        "elements": [
-            {
-                "type": "button",
-                "text": {"type": "plain_text", "text": "📋 전체 신규 공고 보기", "emoji": True},
-                "url": f"{BASE_URL}/recruitment/recruits?listType=D3NEW",
-                "style": "primary",
-            },
-        ],
+        "elements": [{
+            "type": "button",
+            "text": {"type": "plain_text", "text": "📋 전체 신규 공고 보기", "emoji": True},
+            "url": f"{BASE_URL}/recruitment/recruits?listType=D3NEW",
+            "style": "primary",
+        }],
     })
     blocks.append({
         "type": "context",
-        "elements": [
-            {
-                "type": "image",
-                "image_url": "https://hibrain.net/favicon.ico",
-                "alt_text": "hibrain",
-            },
-            {"type": "mrkdwn", "text": "HiBrain Job Alert · 자동 수집 봇"},
-        ],
+        "elements": [{"type": "mrkdwn", "text": "HiBrain Job Alert · 자동 수집 봇"}],
     })
 
-    return {
-        "attachments": [
-            {
-                "color": _accent_color(display_jobs),
-                "blocks": blocks,
-            }
-        ]
-    }
+    # Slack: 첨부당 최대 50블록. 초과 시 잘라내고 안내.
+    if len(blocks) > 50:
+        blocks = blocks[:48]
+        blocks.append({"type": "divider"})
+        blocks.append({"type": "context", "elements": [
+            {"type": "mrkdwn", "text": "…일부 항목은 생략되었습니다. 전체 보기에서 확인하세요."}]})
+
+    color = COLOR_URGENT if urgent else COLOR_DEFAULT
+    return {"attachments": [{"color": color, "blocks": blocks}]}
 
 
 def webhook_label(url: str) -> str:
@@ -551,160 +578,11 @@ def send_to_slack(message: dict) -> tuple[int, int]:
     return delivered, len(urls)
 
 
-# ─────────────────────────────────────────────────────────────
-# 이미지 카드 렌더링 + Slack 파일 업로드
-# ─────────────────────────────────────────────────────────────
-
-def render_cards(jobs: list[dict]) -> list[str]:
-    """공고들을 개별 상품 카드(PNG)로 렌더링해 경로 목록을 반환한다.
-
-    Playwright/Chromium이 없거나 렌더링에 실패하면 빈 리스트를 반환해
-    호출 측이 텍스트(Block Kit) 방식으로 폴백할 수 있게 한다.
-    """
-    try:
-        import card_renderer
-    except Exception as e:
-        log(f"카드 렌더러를 불러올 수 없습니다: {e}")
-        return []
-
-    out_dir = str(Path(__file__).parent / "cards")
-    try:
-        paths = card_renderer.render_cards(jobs, out_dir)
-    except Exception as e:
-        log(f"이미지 카드 렌더링 실패 (텍스트 방식으로 폴백): {type(e).__name__}: {e}")
-        return []
-
-    log(f"이미지 카드 {len(paths)}장 렌더링 완료")
-    return paths
-
-
-def _slack_api(method: str, token: str, **kwargs) -> dict:
-    """Slack Web API 호출 헬퍼. 응답 JSON을 반환한다."""
-    url = f"https://slack.com/api/{method}"
-    headers = {"Authorization": f"Bearer {token}"}
-    resp = requests.post(url, headers=headers, timeout=30, **kwargs)
-    try:
-        return resp.json()
-    except ValueError:
-        return {"ok": False, "error": f"non_json_response_{resp.status_code}"}
-
-
-def _upload_one_file(path: str, token: str, title: str) -> Optional[str]:
-    """파일 1개를 Slack에 업로드하고 file_id를 반환. 실패 시 None."""
-    try:
-        size = os.path.getsize(path)
-        filename = os.path.basename(path)
-    except OSError as e:
-        log(f"이미지 파일을 읽을 수 없습니다: {e}")
-        return None
-
-    info = _slack_api(
-        "files.getUploadURLExternal", token,
-        data={"filename": filename, "length": str(size)},
-    )
-    if not info.get("ok"):
-        log(f"Slack 업로드 URL 발급 실패({filename}): {info.get('error')}")
-        return None
-
-    try:
-        with open(path, "rb") as f:
-            up = requests.post(info["upload_url"], files={"file": (filename, f, "image/png")}, timeout=60)
-        if not up.ok:
-            log(f"Slack 파일 업로드 실패({filename}): HTTP {up.status_code}")
-            return None
-    except requests.RequestException as e:
-        log(f"Slack 파일 업로드 네트워크 오류({filename}): {e}")
-        return None
-
-    return info["file_id"]
-
-
-def upload_cards_to_slack(image_paths: list[str], titles: list[str], comment: str) -> tuple[int, int]:
-    """여러 카드 이미지를 한 메시지로 Slack 채널들에 게시한다(갤러리).
-
-    최신 external-upload 흐름:
-      1) 각 파일마다 files.getUploadURLExternal → 바이트 업로드
-      2) files.completeUploadExternal 를 files 배열로 한 번 호출 → 갤러리로 표시
-
-    SLACK_BOT_TOKEN + SLACK_CHANNEL_IDS 가 없으면 (0, 0)을 반환해 폴백하게 한다.
-    """
-    token = os.environ.get("SLACK_BOT_TOKEN", "").strip()
-    channels = [c.strip() for c in os.environ.get("SLACK_CHANNEL_IDS", "").split(",") if c.strip()]
-    if not token or not channels:
-        return 0, 0
-    if not image_paths:
-        return 0, len(channels)
-
-    # 1) 모든 파일 업로드 → file_id 수집
-    files_meta = []
-    for path, title in zip(image_paths, titles):
-        file_id = _upload_one_file(path, token, title)
-        if file_id:
-            files_meta.append({"id": file_id, "title": title})
-
-    if not files_meta:
-        log("업로드된 카드가 없어 이미지 게시를 건너뜁니다.")
-        return 0, len(channels)
-
-    # 2) 채널별로 한 번에 게시 (files 배열 → 갤러리)
-    import json as _json
-    delivered = 0
-    for ch in channels:
-        res = _slack_api(
-            "files.completeUploadExternal", token,
-            data={
-                "files": _json.dumps(files_meta),
-                "channel_id": ch,
-                "initial_comment": comment,
-            },
-        )
-        if res.get("ok"):
-            delivered += 1
-            log(f"Slack 채널 {ch} 카드 {len(files_meta)}장 게시 완료!")
-        else:
-            log(f"Slack 채널 {ch} 카드 게시 실패: {res.get('error')}")
-
-    log(f"Slack 이미지 전송 결과: {delivered}/{len(channels)} 채널 성공")
-    return delivered, len(channels)
-
-
-def deliver_jobs(jobs: list[dict], *, subtitle: str, comment: str) -> tuple[int, int]:
-    """공고를 Slack에 전달한다. 상품 카드 갤러리를 우선 시도하고, 불가하면 Block Kit로 폴백.
-
-    반환: (성공 채널 수, 대상 채널 수). 이미지/웹훅 중 실제 사용된 경로 기준.
-    """
-    # 봇 토큰 + 채널이 설정된 경우에만 이미지 카드 경로를 시도
-    if os.environ.get("SLACK_BOT_TOKEN", "").strip() and os.environ.get("SLACK_CHANNEL_IDS", "").strip():
-        card_jobs = jobs[:CARD_ROWS]
-        paths = render_cards(card_jobs)
-        if paths:
-            titles = [j.get("title", "채용공고") for j in card_jobs]
-            delivered, total = upload_cards_to_slack(paths, titles, comment=comment)
-            if delivered > 0:
-                return delivered, total
-            log("이미지 전송이 실패하여 텍스트(Block Kit) 방식으로 폴백합니다.")
-
-    # 폴백: 기존 Block Kit 메시지 (웹훅)
-    message = build_slack_message(jobs, title=f"📢 {subtitle}")
-    return send_to_slack(message)
-
-
-def _deliver(message: dict) -> None:
-    """Slack 전송 후 결과에 따라 프로세스 종료 코드를 정한다."""
-    delivered, total = send_to_slack(message)
-    if total and not delivered:
-        log("모든 Slack 채널 전송에 실패했습니다.")
-        sys.exit(1)
-
-
 def run_test_mode(jobs: list[dict]) -> None:
-    sample = jobs[:CARD_ROWS]
+    sample = jobs[:30]
     log(f"[테스트 모드] 최근 {len(sample)}개 공고를 샘플로 Slack에 전송합니다.")
-    delivered, total = deliver_jobs(
-        sample,
-        subtitle=f"[테스트] 신규 채용공고 {len(sample)}건",
-        comment=f"🧪 테스트 알림 · 신규 채용공고 {len(sample)}건",
-    )
+    message = build_slack_message(sample, title=f"🧪 [테스트] 하이브레인 신규 채용 {len(sample)}건")
+    delivered, total = send_to_slack(message)
     if total and not delivered:
         log("모든 Slack 채널 전송에 실패했습니다.")
         sys.exit(1)
@@ -745,14 +623,11 @@ def main():
 
     new_jobs.sort(key=sort_key)
 
-    delivered, total = deliver_jobs(
-        new_jobs,
-        subtitle=f"신규 채용공고 {len(new_jobs)}건",
-        comment=f"📢 하이브레인 신규 채용공고 *{len(new_jobs)}건*이 등록되었습니다.",
-    )
+    message = build_slack_message(new_jobs)
+    delivered, total = send_to_slack(message)
 
     if total == 0:
-        log("Slack 전송 대상(웹훅/채널)이 없어 seen_jobs.json을 갱신하지 않습니다.")
+        log("Slack 웹훅이 없어 seen_jobs.json을 갱신하지 않습니다.")
         return
 
     if delivered == 0:
