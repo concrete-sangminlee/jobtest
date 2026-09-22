@@ -7,3 +7,4 @@ venv/
 
 # 렌더링된 이미지 카드 (런타임 산출물)
 job_card.png
+cards/
