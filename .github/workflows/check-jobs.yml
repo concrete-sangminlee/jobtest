@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       test_mode:
-        description: "테스트 모드 (샘플 3건만 Slack 전송)"
+        description: "테스트 모드 (샘플 공고를 Slack 전송)"
         type: boolean
         default: false
 
@@ -29,19 +29,9 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Install Korean fonts (for image card rendering)
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq fonts-noto-cjk fonts-noto-color-emoji
-
-      - name: Install Playwright Chromium
-        run: python -m playwright install --with-deps chromium
-
       - name: Run scraper
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-          SLACK_CHANNEL_IDS: ${{ secrets.SLACK_CHANNEL_IDS }}
           SCRAPER_API_KEY: ${{ secrets.SCRAPER_API_KEY }}
           TEST_MODE: ${{ inputs.test_mode }}
         run: python scraper.py
