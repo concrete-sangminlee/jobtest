@@ -258,77 +258,76 @@ def compute_d_day(end_date: str) -> Optional[int]:
     return (deadline - today).days
 
 
-# 색상 팔레트 (Slack attachment 좌측 색상 바)
-COLOR_DEFAULT = "#0A66C2"   # 하이브레인 블루
-
-
-def _sort_key(j: dict):
-    """마감 임박 순 → 상시/미정/마감은 뒤로."""
-    d = j.get("d_day")
-    if j.get("always_open") or d is None or d < 0:
-        return (1, 10 ** 6)
-    return (0, d)
-
-
-def _truncate(text: str, limit: int) -> str:
-    text = text or ""
-    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
-
-
-def _job_line(job: dict) -> str:
-    """공고 1건 = 한 줄. 제목이 곧 지원 링크. (군더더기 없음)"""
-    title = _truncate(job.get("title", "(제목 없음)"), 90)
-    url = job.get("url", "")
-    return f"• <{url}|{title}>" if url else f"• {title}"
-
-
 def build_slack_message(new_jobs: list[dict], *, title: str = "") -> dict:
     now = datetime.now(KST)
-    timestamp = now.strftime("%m.%d %H:%M")
+    timestamp = now.strftime("%Y. %m. %d  %H:%M KST")
     count = len(new_jobs)
-    all_url = f"{BASE_URL}/recruitment/recruits?listType=D3NEW"
+    display_jobs = new_jobs[:20]
 
-    jobs = sorted(new_jobs, key=_sort_key)
-    header = title or f"하이브레인 신규 채용 {count}건"
+    header_line = title or "*📢  하이브레인 신규 채용공고*"
 
-    lines = [_job_line(j) for j in jobs]
-
-    blocks: list[dict] = [
-        {"type": "header", "text": {"type": "plain_text", "text": header[:150], "emoji": True}},
-        {"type": "context", "elements": [{"type": "mrkdwn",
-            "text": f"{timestamp} · <{all_url}|전체 보기>"}]},
+    blocks = [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": header_line},
+        },
+        {
+            "type": "context",
+            "elements": [
+                {"type": "mrkdwn", "text": f"🏢 하이브레인  ｜  🔔 *{count}건*의 새로운 채용공고"},
+            ],
+        },
         {"type": "divider"},
     ]
 
-    # 링크 줄들을 Slack 한계(섹션당 3000자, 첨부당 50블록) 안에서 채운다.
-    # 1) 줄들을 2900자 이하 청크(=섹션)로 묶는다. 각 청크는 담긴 줄 수를 함께 기록.
-    chunks: list[tuple[str, int]] = []  # (텍스트, 줄 수)
-    chunk, n = "", 0
-    for line in lines:
-        piece = ("\n" if chunk else "") + line
-        if chunk and len(chunk) + len(piece) > 2900:
-            chunks.append((chunk, n))
-            chunk, n = line, 1
-        else:
-            chunk += piece
-            n += 1
-    if chunk:
-        chunks.append((chunk, n))
+    for job in display_jobs:
+        title_line = f"> *<{job['url']}|{job['title']}>*"
+        if job.get("period"):
+            title_line += f"\n> 📅 `{job['period']}`"
 
-    # 2) 블록 예산 안에서 담을 수 있는 청크만 채택.
-    max_body_blocks = 50 - len(blocks) - 1  # 마지막 안내용 1블록 여유
-    kept = chunks[:max_body_blocks]
-    shown = sum(cnt for _, cnt in kept)
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": title_line},
+            "accessory": {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "지원하기", "emoji": True},
+                "url": job["url"],
+                "style": "primary",
+            },
+        })
 
-    for text, _ in kept:
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": text}})
+    blocks.append({"type": "divider"})
 
-    hidden = count - shown
-    if hidden > 0:
-        blocks.append({"type": "context", "elements": [{"type": "mrkdwn",
-            "text": f"…외 *{hidden}건*  ·  <{all_url}|전체 보기 →>"}]})
+    blocks.append({
+        "type": "actions",
+        "elements": [
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "📋 전체 채용공고 보기", "emoji": True},
+                "url": f"{BASE_URL}/recruitment/recruits?listType=D3NEW",
+            },
+        ],
+    })
 
-    return {"attachments": [{"color": COLOR_DEFAULT, "blocks": blocks}]}
+    footer_text = f"🤖 HiBrain Job Alert  ｜  {timestamp}"
+    if count > 20:
+        footer_text = f"외 *{count - 20}건* 추가  ｜  " + footer_text
+
+    blocks.append({
+        "type": "context",
+        "elements": [
+            {"type": "mrkdwn", "text": footer_text},
+        ],
+    })
+
+    return {
+        "attachments": [
+            {
+                "color": "#0054a6",
+                "blocks": blocks,
+            }
+        ]
+    }
 
 
 def webhook_label(url: str) -> str:
