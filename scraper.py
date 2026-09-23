@@ -260,31 +260,6 @@ def compute_d_day(end_date: str) -> Optional[int]:
 
 # 색상 팔레트 (Slack attachment 좌측 색상 바)
 COLOR_DEFAULT = "#0A66C2"   # 하이브레인 블루
-# 한 번에 나열할 최대 공고 수 (초과분은 "…외 N건")
-MAX_LINES = _env_int("SLACK_MAX_LINES", 25)
-
-
-def _short_date(end: str) -> str:
-    """'YYYY.MM.DD' → 'MM.DD'. 실패 시 원문."""
-    m = re.search(r"\d{4}\D+(\d{1,2})\D+(\d{1,2})", end or "")
-    return f"{int(m.group(1)):02d}.{int(m.group(2)):02d}" if m else (end or "")
-
-
-def _deadline_tag(job: dict) -> str:
-    """마감 표기. 예: 'D-2' / '~10.05' / '상시'."""
-    if job.get("always_open"):
-        return "상시"
-    d = job.get("d_day")
-    short = _short_date(job.get("end_date", ""))
-    if d is None:
-        return short or "미정"
-    if d < 0:
-        return "마감"
-    if d == 0:
-        return "D-DAY"
-    if d <= 7:
-        return f"D-{d}"
-    return f"~{short}" if short else f"D-{d}"
 
 
 def _sort_key(j: dict):
@@ -301,59 +276,57 @@ def _truncate(text: str, limit: int) -> str:
 
 
 def _job_line(job: dict) -> str:
-    """공고 1건 = 한 줄. 제목이 지원 링크, 뒤에 기관·지역·마감."""
-    title = _truncate(job.get("title", "(제목 없음)"), 70)
+    """공고 1건 = 한 줄. 제목이 곧 지원 링크. (군더더기 없음)"""
+    title = _truncate(job.get("title", "(제목 없음)"), 90)
     url = job.get("url", "")
-    head = f"<{url}|{title}>" if url else title
-
-    meta = []
-    if job.get("company"):
-        meta.append(_truncate(job["company"], 20))
-    if job.get("region"):
-        meta.append(_truncate(job["region"], 10))
-    meta.append(_deadline_tag(job))
-
-    return f"• {head}  ·  `{'  ·  '.join(meta)}`"
+    return f"• <{url}|{title}>" if url else f"• {title}"
 
 
 def build_slack_message(new_jobs: list[dict], *, title: str = "") -> dict:
     now = datetime.now(KST)
     timestamp = now.strftime("%m.%d %H:%M")
     count = len(new_jobs)
+    all_url = f"{BASE_URL}/recruitment/recruits?listType=D3NEW"
 
     jobs = sorted(new_jobs, key=_sort_key)
-    shown = jobs[:MAX_LINES]
-    hidden = count - len(shown)
-
     header = title or f"하이브레인 신규 채용 {count}건"
 
-    lines = [_job_line(j) for j in shown]
-    if hidden > 0:
-        lines.append(f"…외 {hidden}건")
-
-    # Slack 3000자 제한 대비: 줄들을 청크로 나눠 section 여러 개로.
-    sections, chunk = [], ""
-    for line in lines:
-        piece = ("\n" if chunk else "") + line
-        if len(chunk) + len(piece) > 2900:
-            sections.append(chunk)
-            chunk = line
-        else:
-            chunk += piece
-    if chunk:
-        sections.append(chunk)
+    lines = [_job_line(j) for j in jobs]
 
     blocks: list[dict] = [
         {"type": "header", "text": {"type": "plain_text", "text": header[:150], "emoji": True}},
         {"type": "context", "elements": [{"type": "mrkdwn",
-            "text": f"{timestamp} · <{BASE_URL}/recruitment/recruits?listType=D3NEW|전체 보기>"}]},
+            "text": f"{timestamp} · <{all_url}|전체 보기>"}]},
         {"type": "divider"},
     ]
-    for text in sections:
+
+    # 링크 줄들을 Slack 한계(섹션당 3000자, 첨부당 50블록) 안에서 채운다.
+    # 1) 줄들을 2900자 이하 청크(=섹션)로 묶는다. 각 청크는 담긴 줄 수를 함께 기록.
+    chunks: list[tuple[str, int]] = []  # (텍스트, 줄 수)
+    chunk, n = "", 0
+    for line in lines:
+        piece = ("\n" if chunk else "") + line
+        if chunk and len(chunk) + len(piece) > 2900:
+            chunks.append((chunk, n))
+            chunk, n = line, 1
+        else:
+            chunk += piece
+            n += 1
+    if chunk:
+        chunks.append((chunk, n))
+
+    # 2) 블록 예산 안에서 담을 수 있는 청크만 채택.
+    max_body_blocks = 50 - len(blocks) - 1  # 마지막 안내용 1블록 여유
+    kept = chunks[:max_body_blocks]
+    shown = sum(cnt for _, cnt in kept)
+
+    for text, _ in kept:
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": text}})
 
-    if len(blocks) > 50:
-        blocks = blocks[:50]
+    hidden = count - shown
+    if hidden > 0:
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn",
+            "text": f"…외 *{hidden}건*  ·  <{all_url}|전체 보기 →>"}]})
 
     return {"attachments": [{"color": COLOR_DEFAULT, "blocks": blocks}]}
 
