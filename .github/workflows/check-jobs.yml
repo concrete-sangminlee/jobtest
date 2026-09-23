@@ -2,10 +2,11 @@ name: Check hibrain.net Job Postings
 
 on:
   schedule:
-    # 하루 3회 (KST 기준) — GitHub Actions cron은 UTC 기준
-    - cron: "0 0 * * *"  # 09:00 KST
-    - cron: "0 5 * * *"  # 14:00 KST
-    - cron: "0 10 * * *" # 19:00 KST
+    # 하루 3회 (KST 기준) — GitHub Actions cron은 UTC 기준.
+    # 정각(:00)은 큐가 붐벼 지연이 크므로 :07로 살짝 비켜 예약.
+    - cron: "7 0 * * *"  # 09:07 KST
+    - cron: "7 5 * * *"  # 14:07 KST
+    - cron: "7 10 * * *" # 19:07 KST
   workflow_dispatch:
     inputs:
       test_mode:
