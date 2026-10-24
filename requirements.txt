@@ -1,2 +1,4 @@
-requests
-beautifulsoup4
+# 패치 업데이트는 받고 호환성 깨는 메이저 업그레이드는 막는다.
+# (예전에 beautifulsoup4가 조용히 메이저 올라가 파서 동작이 바뀐 적 있음)
+requests~=2.34
+beautifulsoup4~=4.15
