@@ -6,9 +6,14 @@ on:
     paths-ignore: [seen_jobs.json]
 permissions:
   contents: read
+env:
+  PYTHONUTF8: "1"
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4

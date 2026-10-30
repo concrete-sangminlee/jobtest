@@ -74,19 +74,30 @@ def save_state(path, state):
 
 @contextmanager
 def state_lock(path):
-    # Linux/macOS CLI and GitHub-hosted runners. The lock file is never committed.
-    import fcntl
+    # Lock a byte on Windows and the whole file on POSIX. Never commit this file.
     lock_path = Path(str(path) + ".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a") as f:
+    with lock_path.open("a+b") as f:
+        if os.name == "nt":
+            import msvcrt
+            if f.tell() == 0:
+                f.write(b"0")
+                f.flush()
+            f.seek(0)
+            acquire = lambda: msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+            release = lambda: (f.seek(0), msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1))
+        else:
+            import fcntl
+            acquire = lambda: fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            release = lambda: fcntl.flock(f, fcntl.LOCK_UN)
         try:
-            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+            acquire()
+        except OSError:
             raise RuntimeError("다른 수집 프로세스가 실행 중입니다.") from None
         try:
             yield
         finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
+            release()
 
 
 def post_message(url, message, log=print):

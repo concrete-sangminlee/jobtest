@@ -32,7 +32,7 @@ python scraper.py --dry-run --report run_summary.json
 4. 기존 `SCRAPER_API_KEY`는 더 이상 읽지 않습니다. 해당 secret은 삭제해도 됩니다.
 5. 실패를 놓치지 않도록 GitHub 개인 알림 설정에서 Actions 실패 알림을 활성화하세요.
 
-수동 검증의 `runner`에서 `ubuntu-latest` 또는 `macos-latest`를 선택해 실행 위치별 접근 여부를
+수동 검증의 `runner`에서 `ubuntu-latest`, `macos-latest`, `windows-latest`, `ubuntu-24.04-arm`을 선택해 실행 위치별 접근 여부를
 확인할 수 있습니다. 성공한 환경을 예약 실행에 쓰려면 `JOB_RUNNER`를 JSON 문자열
 `"macos-latest"`처럼 설정하세요. `configured`는 기존 저장소 설정을 사용합니다.
 공개 저장소의 표준 GitHub-hosted runner는 무료입니다. 비공개 저장소는 사용 한도/요금을 확인하세요.

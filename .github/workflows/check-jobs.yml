@@ -17,6 +17,8 @@ on:
           - configured
           - ubuntu-latest
           - macos-latest
+          - windows-latest
+          - ubuntu-24.04-arm
 
 concurrency:
   group: hibrain-delivery-${{ github.ref }}
@@ -24,6 +26,9 @@ concurrency:
 
 permissions:
   contents: read
+
+env:
+  PYTHONUTF8: "1"
 
 jobs:
   check-jobs:
