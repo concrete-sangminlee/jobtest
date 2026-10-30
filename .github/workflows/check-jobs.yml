@@ -2,48 +2,80 @@ name: Check hibrain.net Job Postings
 
 on:
   schedule:
-    # 하루 3회 (KST 기준) — GitHub Actions cron은 UTC 기준.
-    # 정각(:00)은 큐가 붐벼 지연이 크므로 :07로 살짝 비켜 예약.
-    - cron: "7 0 * * *"  # 09:07 KST
-    - cron: "7 5 * * *"  # 14:07 KST
-    - cron: "7 10 * * *" # 19:07 KST
+    - cron: "7 0,5,10 * * *" # 09:07, 14:07, 19:07 KST; may be delayed by GitHub.
   workflow_dispatch:
     inputs:
-      test_mode:
-        description: "테스트 모드 (샘플 공고를 Slack 전송)"
+      dry_run:
+        description: "수집만 검증 (Slack 전송·상태 변경 없음)"
         type: boolean
-        default: false
+        default: true
+
+concurrency:
+  group: hibrain-delivery-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
 
 jobs:
   check-jobs:
-    runs-on: ubuntu-latest
-
+    runs-on: ${{ fromJSON(vars.JOB_RUNNER || '"ubuntu-latest"') }}
+    timeout-minutes: 15
     permissions:
       contents: write
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
+          cache: pip
       - name: Install dependencies
-        run: pip install -r requirements.txt
-
+        run: |
+          python -m pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+      - name: Run regression tests
+        run: python -m unittest discover -s tests -v
       - name: Run scraper
+        id: scrape
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          SCRAPER_API_KEY: ${{ secrets.SCRAPER_API_KEY }}
-          TEST_MODE: ${{ inputs.test_mode }}
-        run: python scraper.py
-
-      - name: Commit updated seen_jobs.json
+          DRY_RUN: ${{ inputs.dry_run || false }}
+          FETCH_MODE: ${{ vars.FETCH_MODE || 'auto' }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        shell: bash
         run: |
+          if [[ "$DRY_RUN" != "true" && "$GITHUB_REF_NAME" != "$DEFAULT_BRANCH" ]]; then
+            echo "::error::실제 전송은 기본 브랜치에서만 허용합니다. dry_run=true로 검증하세요."
+            exit 1
+          fi
+          args=(--report run_summary.json)
+          if [[ "$DRY_RUN" == "true" ]]; then args+=(--dry-run); fi
+          python scraper.py "${args[@]}"
+      - name: Persist delivery state even after partial failure
+        if: ${{ !cancelled() && steps.scrape.outcome != 'skipped' && steps.scrape.outcome != '' && !inputs.dry_run }}
+        shell: bash
+        run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add seen_jobs.json
-          git diff --staged --quiet || git commit -m "Update seen_jobs.json"
-          git push
+          if git diff --staged --quiet; then exit 0; fi
+          git commit -m "Update delivery state [skip ci]"
+          for attempt in 1 2 3; do
+            if git push origin "HEAD:${GITHUB_REF_NAME}"; then exit 0; fi
+            git pull --rebase origin "$GITHUB_REF_NAME"
+            sleep "$attempt"
+          done
+          exit 1
+      - name: Save diagnostic and recovery files
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: job-alert-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            run_summary.json
+            seen_jobs.json
+          retention-days: 14

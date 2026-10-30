@@ -1,50 +1,20 @@
+import argparse
 import json
 import os
 import re
 import sys
-import time
 from datetime import datetime, timezone, timedelta
-from html import unescape
+from html import unescape, escape
 from pathlib import Path
 from typing import Optional
-from urllib.parse import quote
 
-import requests
+from fetcher import BASE_URL, LIST_URL, FetchError, fetch_page
+from delivery import deliver, load_state, state_lock, webhook_urls
 from bs4 import BeautifulSoup
 
 KST = timezone(timedelta(hours=9))
 
-BASE_URL = "https://hibrain.net"
-LIST_URL = f"{BASE_URL}/recruitment/recruits?listType=D3NEW&pagesize=50&sortType=SORTDTM"
 SEEN_FILE = Path(__file__).parent / "seen_jobs.json"
-MAX_SEEN = 500
-
-
-def _env_int(name: str, default: int) -> int:
-    """환경변수를 정수로 읽되, 값이 없거나 잘못되면 기본값을 쓴다."""
-    raw = os.environ.get(name)
-    if raw is None or not raw.strip():
-        return default
-    try:
-        return int(raw.strip())
-    except ValueError:
-        return default
-
-
-# 네트워크 튜닝 (환경변수로 재정의 가능)
-MAX_ATTEMPTS = _env_int("FETCH_MAX_ATTEMPTS", 3)      # 각 방식당 최대 시도 횟수
-BACKOFF_BASE = _env_int("FETCH_BACKOFF_BASE", 3)      # 재시도 대기(초) = BACKOFF_BASE * 시도횟수
-SCRAPERAPI_TIMEOUT = _env_int("SCRAPERAPI_TIMEOUT", 70)  # ScraperAPI는 프록시/렌더링으로 느릴 수 있어 넉넉히
-DIRECT_TIMEOUT = _env_int("DIRECT_TIMEOUT", 30)
-
-BROWSER_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-}
 
 
 def log(msg: str) -> None:
@@ -52,113 +22,38 @@ def log(msg: str) -> None:
     print(f"[{datetime.now(KST):%H:%M:%S}] {msg}", flush=True)
 
 
-def load_seen() -> list[str]:
-    if SEEN_FILE.exists():
-        return json.loads(SEEN_FILE.read_text(encoding="utf-8"))
-    return []
-
-
-def save_seen(seen: list[str]) -> None:
-    seen = seen[-MAX_SEEN:]
-    SEEN_FILE.write_text(json.dumps(seen, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
 def extract_job_id(href: str) -> str:
     match = re.search(r"/recruits/(\d+)", href)
     return match.group(1) if match else ""
 
 
-def _looks_like_job_list(html: str) -> bool:
-    """응답이 실제 채용 목록 페이지인지 최소 검증. (차단 페이지/빈 응답 거르기)"""
-    return bool(html) and 'id="articleList"' in html
-
-
-def _fetch_via_scraperapi(api_key: str) -> str:
-    # HTTPS 엔드포인트를 사용해 프록시 구간 신뢰성을 높인다.
-    url = (
-        "https://api.scraperapi.com/"
-        f"?api_key={api_key}&url={quote(LIST_URL)}"
-    )
-    resp = requests.get(url, timeout=SCRAPERAPI_TIMEOUT)
-    resp.raise_for_status()
-    return resp.text
-
-
-def _fetch_direct() -> str:
-    resp = requests.get(LIST_URL, headers=BROWSER_HEADERS, timeout=DIRECT_TIMEOUT)
-    resp.raise_for_status()
-    return resp.text
-
-
-def _try_method(name: str, fetch_fn) -> Optional[str]:
-    """한 가지 방식(ScraperAPI 또는 직접)을 재시도와 함께 실행한다.
-
-    성공적으로 채용 목록으로 보이는 HTML을 얻으면 반환하고,
-    모든 시도가 실패하면 None을 반환한다.
-    """
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        try:
-            log(f"{name} 시도 {attempt}/{MAX_ATTEMPTS}...")
-            html = fetch_fn()
-        except requests.RequestException as e:
-            log(f"  {name} 실패: {type(e).__name__}: {e}")
-        else:
-            if _looks_like_job_list(html):
-                log(f"  {name} 성공")
-                return html
-            log(f"  {name} 응답에 채용 목록이 없습니다. (차단/빈 응답 가능성)")
-
-        if attempt < MAX_ATTEMPTS:
-            wait = BACKOFF_BASE * attempt
-            log(f"  {wait}초 후 재시도...")
-            time.sleep(wait)
-
-    log(f"{name} 최종 실패")
-    return None
-
-
-def fetch_page() -> str:
-    """채용 목록 HTML을 가져온다.
-
-    ScraperAPI 키가 있으면 먼저 시도(재시도 포함)하고,
-    실패하면 직접 요청으로 폴백한다. 모두 실패하면 예외를 던진다.
-    """
-    scraper_api_key = os.environ.get("SCRAPER_API_KEY")
-
-    if scraper_api_key:
-        html = _try_method("ScraperAPI", lambda: _fetch_via_scraperapi(scraper_api_key))
-        if html is not None:
-            return html
-        log("ScraperAPI가 실패하여 직접 요청으로 폴백합니다.")
-
-    html = _try_method("직접 요청", _fetch_direct)
-    if html is not None:
-        return html
-
-    raise RuntimeError("모든 방식으로 페이지를 가져오지 못했습니다.")
-
-
 def scrape_jobs() -> list[dict]:
-    try:
-        text = fetch_page()
-    except Exception as e:
-        log(f"페이지 가져오기 실패: {e}")
-        return []
+    return parse_jobs(fetch_page(log))
 
+
+def parse_jobs(text: str) -> list[dict]:
     soup = BeautifulSoup(text, "html.parser")
-    article_list = soup.find("ul", id="articleList")
+    article_list = soup.find(id="articleList")
     if not article_list:
-        log("articleList를 찾을 수 없습니다.")
-        return []
-
+        raise FetchError("articleList를 찾을 수 없습니다. 차단 또는 페이지 구조 변경을 확인하세요.")
     jobs = []
     seen_ids = set()
-    for li in article_list.find_all("li", class_="row"):
+    rows = article_list.find_all("li", class_="row")
+    invalid = 0
+    for li in rows:
+        if not li.get_text(strip=True) and not li.find("a", href=True):
+            continue  # Empty spacer/placeholder rows are not job postings.
         job = parse_job_row(li)
-        if job and job["id"] not in seen_ids:
-            seen_ids.add(job["id"])
+        if not job:
+            invalid += 1
+        elif job["id"] not in seen_ids:
             jobs.append(job)
-
+            seen_ids.add(job["id"])
+    if not jobs:
+        raise FetchError("유효한 공고가 0건입니다. 빈 목록/차단/파싱 오류를 확인하세요.")
+    if invalid:
+        # Refuse silent partial collection when rows no longer match the parser.
+        raise FetchError(f"공고 행 {invalid}/{len(rows)}개를 파싱하지 못했습니다. 사이트 구조를 확인하세요.")
     return jobs
 
 
@@ -191,7 +86,7 @@ def parse_job_row(li) -> Optional[dict]:
     필수 값(id, title)이 없으면 None을 반환하고,
     부가 값(회사/지역/유형/마감일)은 있으면 채우고 없으면 생략한다.
     """
-    link_tag = li.find("a", href=True)
+    link_tag = li.find("a", href=re.compile(r"/recruits/\d+"))
     if not link_tag:
         return None
 
@@ -240,11 +135,14 @@ def parse_job_row(li) -> Optional[dict]:
 
 def _parse_date(text: str) -> Optional[datetime]:
     """'2026.09.21' / '2026-09-21' / '2026.9.21' 같은 표기를 날짜로 파싱."""
-    m = re.search(r"(\d{4})\D+(\d{1,2})\D+(\d{1,2})", text or "")
+    m = re.search(r"(?<!\d)(\d{4}|\d{2})[.\-/]\s*(\d{1,2})[.\-/]\s*(\d{1,2})(?!\d)", text or "")
     if not m:
         return None
     try:
-        return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)), tzinfo=KST)
+        year = int(m.group(1))
+        if len(m.group(1)) == 2:
+            year += 2000
+        return datetime(year, int(m.group(2)), int(m.group(3)), tzinfo=KST)
     except ValueError:
         return None
 
@@ -262,7 +160,9 @@ def build_slack_message(new_jobs: list[dict], *, title: str = "") -> dict:
     now = datetime.now(KST)
     timestamp = now.strftime("%Y. %m. %d  %H:%M KST")
     count = len(new_jobs)
-    display_jobs = new_jobs[:20]
+    if not 1 <= count <= 20:
+        raise ValueError("Slack 메시지는 1~20건씩 생성해야 합니다.")
+    display_jobs = new_jobs
 
     header_line = title or "*📢  하이브레인 신규 채용공고*"
 
@@ -281,9 +181,11 @@ def build_slack_message(new_jobs: list[dict], *, title: str = "") -> dict:
     ]
 
     for job in display_jobs:
-        title_line = f"> *<{job['url']}|{job['title']}>*"
+        safe_title = escape(job["title"][:500], quote=False).replace("|", "｜")
+        title_line = f"> *<{job['url']}|{safe_title}>*"
         if job.get("period"):
-            title_line += f"\n> 📅 `{job['period']}`"
+            safe_period = escape(job["period"][:100], quote=False).replace("`", "")
+            title_line += f"\n> 📅 `{safe_period}`"
 
         blocks.append({
             "type": "section",
@@ -310,8 +212,6 @@ def build_slack_message(new_jobs: list[dict], *, title: str = "") -> dict:
     })
 
     footer_text = f"🤖 HiBrain Job Alert  ｜  {timestamp}"
-    if count > 20:
-        footer_text = f"외 *{count - 20}건* 추가  ｜  " + footer_text
 
     blocks.append({
         "type": "context",
@@ -321,6 +221,7 @@ def build_slack_message(new_jobs: list[dict], *, title: str = "") -> dict:
     })
 
     return {
+        "text": f"하이브레인 신규 채용공고 {count}건",
         "attachments": [
             {
                 "color": "#0054a6",
@@ -330,170 +231,73 @@ def build_slack_message(new_jobs: list[dict], *, title: str = "") -> dict:
     }
 
 
-def webhook_label(url: str) -> str:
-    """웹훅 URL에서 토큰을 제거한 식별용 라벨. (로그에 시크릿이 남지 않도록)"""
-    parts = url.rstrip("/").split("/")
-    if len(parts) >= 2:
-        return f".../{parts[-2]}/***"
-    return "***"
+def write_report(report, output):
+    text = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
+    if output:
+        Path(output).write_text(text, encoding="utf-8")
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a", encoding="utf-8") as f:
+            f.write("### HiBrain 수집 결과\n\n```json\n" + text + "```\n")
 
 
-def redact(text: str, url: str) -> str:
-    """예외/응답 메시지에 섞여 있을 수 있는 웹훅 토큰을 가립니다."""
-    token = url.rstrip("/").rsplit("/", 1)[-1]
-    return text.replace(token, "***") if token else text
+def run(dry_run=False, state_path=SEEN_FILE):
+    report = {"time": datetime.now(KST).isoformat(), "dry_run": dry_run,
+              "collected": 0, "delivered": 0, "failed_channels": 0, "pending": 0}
+    urls = [] if dry_run else webhook_urls()
+    # Validate state before collecting/sending; never silently reset corrupted state.
+    state = load_state(state_path)
+    fetch_error = None
+    try:
+        jobs = scrape_jobs()
+        report["collected"] = len(jobs)
+        log(f"총 {len(jobs)}개 공고 발견")
+    except FetchError as exc:
+        jobs = []
+        fetch_error = str(exc)
+        log(fetch_error)
+    if dry_run:
+        # Generate every batch for payload validation; no POST and no state writes.
+        for offset in range(0, len(jobs), 20):
+            build_slack_message(jobs[offset:offset + 20])
+    else:
+        def sort_key(job):
+            day = compute_d_day(job.get("end_date", ""))
+            return (1, 0) if job.get("always_open") or day is None or day < 0 else (0, day)
+        jobs.sort(key=sort_key)
+        # Retry an existing outbox even if today's collection fails.
+        report.update(deliver(jobs, urls, state_path, state, build_slack_message, log))
+    report["status"] = "failed" if fetch_error or report["failed_channels"] else "success"
+    if fetch_error:
+        report["error"] = fetch_error
+    return report
 
 
-# Slack 웹훅이 돌려주는 에러 본문별 안내
-SLACK_ERROR_HINTS = {
-    "channel_is_archived": "채널이 아카이브되었습니다. 채널을 복구하거나 SLACK_WEBHOOK_URL에서 이 웹훅을 제거하세요.",
-    "channel_not_found": "채널을 찾을 수 없습니다. 공개→비공개 전환 후 앱이 채널에서 빠졌을 수 있습니다. 해당 채널에 앱을 다시 초대하세요.",
-    "no_service": "웹훅이 삭제되었습니다. Slack 앱 설정에서 새로 발급받아 SLACK_WEBHOOK_URL을 갱신하세요.",
-    "no_active_hooks": "이 웹훅에 연결된 활성 훅이 없습니다. 웹훅이 폐기되었으니 SLACK_WEBHOOK_URL에서 제거하거나 새 웹훅으로 교체하세요.",
-    "no_team": "워크스페이스에서 앱이 제거되었습니다. 앱을 다시 설치하세요.",
-    "invalid_token": "웹훅 토큰이 유효하지 않습니다. 새로 발급받아 SLACK_WEBHOOK_URL을 갱신하세요.",
-    "action_prohibited": "워크스페이스 관리 정책으로 이 웹훅이 차단되었습니다.",
-}
-
-
-def explain_slack_error(status: int, body: str) -> tuple[str, bool]:
-    """(안내 문구, 영구적 실패 여부)를 반환합니다."""
-    hint = SLACK_ERROR_HINTS.get(body.strip())
-    if hint:
-        return hint, True
-    if status in (404, 410):
-        return (
-            "웹훅이 비활성화되었습니다. 채널 아카이브·앱 제거 등으로 폐기된 웹훅입니다. "
-            "SLACK_WEBHOOK_URL에서 제거하거나 새 웹훅으로 교체하세요.",
-            True,
-        )
-    if status == 403:
-        return "권한이 없습니다. 비공개 채널로 전환된 뒤 앱이 채널에서 빠졌는지 확인하세요.", True
-    if status == 429:
-        return "요청이 제한되었습니다. 다음 주기에 재시도합니다.", False
-    if status >= 500:
-        return "Slack 측 일시적 오류입니다. 다음 주기에 재시도합니다.", False
-    return "알 수 없는 오류입니다.", False
-
-
-def warn(text: str) -> None:
-    """GitHub Actions 실행 요약에도 보이도록 경고를 남깁니다."""
-    prefix = "::warning::" if os.environ.get("GITHUB_ACTIONS") == "true" else "⚠️  "
-    print(f"{prefix}{text}")
-
-
-def send_to_slack(message: dict) -> tuple[int, int]:
-    """메시지를 모든 웹훅에 전송하고 (성공 채널 수, 설정된 채널 수)를 반환합니다.
-
-    한 채널이 실패해도 나머지 채널 전송은 계속 진행합니다.
-    """
-    webhook_urls = os.environ.get("SLACK_WEBHOOK_URL", "")
-    if not webhook_urls:
-        log("SLACK_WEBHOOK_URL 환경변수가 설정되지 않았습니다.")
-        log("Slack 전송을 건너뜁니다. (아래는 전송하려던 메시지 미리보기)")
-        print(json.dumps(message, ensure_ascii=False, indent=2))
-        return 0, 0
-
-    urls = [u.strip() for u in webhook_urls.split(",") if u.strip()]
-    delivered = 0
-    dead_channels = []
-
-    for i, url in enumerate(urls, 1):
-        label = f"채널 {i} ({webhook_label(url)})"
-        try:
-            resp = requests.post(url, json=message, timeout=10)
-        except requests.RequestException as e:
-            log(f"Slack {label} 전송 실패 (네트워크 오류): {redact(str(e), url)}")
-            continue
-
-        if resp.ok:
-            delivered += 1
-            log(f"Slack {label} 전송 완료!")
-            continue
-
-        body = redact(resp.text.strip(), url)
-        hint, permanent = explain_slack_error(resp.status_code, body)
-        detail = f"Slack {label} 전송 실패: HTTP {resp.status_code} {body} — {hint}"
-        if permanent:
-            warn(detail)
-            dead_channels.append(label)
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="무료 하이브레인 수집 및 Slack 알림")
+    parser.add_argument("--dry-run", action="store_true", help="수집/메시지 생성만 검증 (전송·기록 변경 없음)")
+    parser.add_argument("--state-file", type=Path, default=SEEN_FILE)
+    parser.add_argument("--report", type=Path, help="실행 결과 JSON 경로")
+    args = parser.parse_args(argv)
+    try:
+        # A report path must never overwrite state or source files.
+        if args.report and (args.report.resolve() in {args.state_file.resolve(), SEEN_FILE.resolve()} or args.report.suffix != ".json"):
+            args.report = None
+            raise ValueError("--report에는 상태 파일과 다른 .json 경로를 사용하세요.")
+        if args.dry_run:
+            report = run(True, args.state_file)
         else:
-            log(detail)
-
-    log(f"Slack 전송 결과: {delivered}/{len(urls)} 채널 성공")
-
-    if dead_channels:
-        warn(
-            f"영구적으로 실패하는 웹훅 {len(dead_channels)}개: {', '.join(dead_channels)}. "
-            "SLACK_WEBHOOK_URL 시크릿에서 제거하거나 새 웹훅으로 교체하세요."
-        )
-
-    return delivered, len(urls)
-
-
-def run_test_mode(jobs: list[dict]) -> None:
-    sample = jobs[:30]
-    log(f"[테스트 모드] 최근 {len(sample)}개 공고를 샘플로 Slack에 전송합니다.")
-    message = build_slack_message(sample, title=f"🧪 [테스트] 하이브레인 신규 채용 {len(sample)}건")
-    delivered, total = send_to_slack(message)
-    if total and not delivered:
-        log("모든 Slack 채널 전송에 실패했습니다.")
-        sys.exit(1)
-    log(f"테스트 메시지 전송 완료 ({len(sample)}건)")
-
-
-def main():
-    test_mode = os.environ.get("TEST_MODE", "").lower() == "true"
-
-    log("hibrain.net 채용정보 스크래핑 시작...")
-    jobs = scrape_jobs()
-    log(f"총 {len(jobs)}개 공고 발견")
-
-    if not jobs:
-        log("공고를 가져오지 못했습니다. (다음 주기에 재시도)")
-        sys.exit(0)
-
-    if test_mode:
-        run_test_mode(jobs)
-        return
-
-    seen = load_seen()
-    seen_set = set(seen)
-    new_jobs = [j for j in jobs if j["id"] not in seen_set]
-    log(f"신규 공고: {len(new_jobs)}개")
-
-    if not new_jobs:
-        log("새로운 공고가 없습니다.")
-        return
-
-    # 마감 임박 순 → 최신 순으로 정렬해 중요한 공고가 위로 오게 한다.
-    def sort_key(j: dict):
-        d = j.get("d_day")
-        # 상시/마감/파싱불가는 뒤로, 남은 일수가 적을수록 앞으로
-        if j.get("always_open") or d is None or d < 0:
-            return (1, 0)
-        return (0, d)
-
-    new_jobs.sort(key=sort_key)
-
-    message = build_slack_message(new_jobs)
-    delivered, total = send_to_slack(message)
-
-    if total == 0:
-        log("Slack 웹훅이 없어 seen_jobs.json을 갱신하지 않습니다.")
-        return
-
-    if delivered == 0:
-        log("모든 Slack 채널 전송에 실패했습니다.")
-        log("seen_jobs.json을 갱신하지 않고 종료합니다. (다음 주기에 재시도)")
-        sys.exit(1)
-
-    for job in new_jobs:
-        seen.append(job["id"])
-    save_seen(seen)
-
-    log(f"seen_jobs.json 업데이트 완료 (총 {len(load_seen())}개)")
+            with state_lock(args.state_file):
+                report = run(False, args.state_file)
+    except (ValueError, RuntimeError, OSError) as exc:
+        # IO error text can contain paths; our handled errors never contain secret values.
+        log(f"실행 실패: {type(exc).__name__}")
+        report = {"status": "failed", "dry_run": args.dry_run,
+                  "error": str(exc) if isinstance(exc, (ValueError, RuntimeError)) else type(exc).__name__}
+    write_report(report, args.report)
+    log(f"실행 결과: {report['status']}")
+    return 0 if report["status"] == "success" else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
