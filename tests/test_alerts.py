@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -125,6 +126,75 @@ class FetchTests(Isolated):
             with self.assertRaises(fetcher.FetchError):
                 fetcher.fetch_http(log)
         self.assertNotIn('secret-123', str(log.call_args_list))
+
+
+class GoogleBridgeTests(Isolated):
+    def setUp(self):
+        super().setUp()
+        os.environ['GOOGLE_APPS_SCRIPT_URL'] = 'https://script.google.com/macros/s/example-deployment/exec'
+        self.payload = {'ok': True, 'version': 1, 'source': fetcher.LIST_URL,
+                        'fetched_at': datetime.now(timezone.utc).isoformat(), 'html': HTML}
+
+    def bridge_response(self):
+        r = response()
+        r.content = json.dumps(self.payload).encode()
+        r.json.return_value = self.payload
+        return r
+
+    def test_explicit_google_route_uses_fresh_listing_without_browser(self):
+        os.environ['FETCH_MODE'] = 'google'
+        with patch('fetcher.requests.get', return_value=self.bridge_response()), patch('fetcher.fetch_browser') as browser:
+            self.assertEqual(len(scraper.parse_jobs(fetcher.fetch_page())), 1)
+            browser.assert_not_called()
+
+    def test_auto_uses_google_after_direct_collection_fails(self):
+        with patch('fetcher.fetch_http', side_effect=fetcher.FetchError('blocked')), patch('fetcher.requests.get', return_value=self.bridge_response()), patch('fetcher.fetch_browser') as browser:
+            self.assertEqual(fetcher.fetch_page(), HTML)
+            browser.assert_not_called()
+
+    def test_failed_bridge_can_fall_back_to_browser(self):
+        with patch('fetcher.fetch_http', side_effect=fetcher.FetchError('blocked')), patch('fetcher.fetch_google_bridge', side_effect=fetcher.FetchError('blocked')), patch('fetcher.fetch_browser', return_value=HTML) as browser:
+            self.assertEqual(fetcher.fetch_page(), HTML)
+            browser.assert_called_once()
+
+    def test_invalid_or_stale_payload_is_never_accepted(self):
+        cases = [
+            {'ok': False}, {'version': 2}, {'source': 'https://example.com'},
+            {'html': 'Login required'}, {'fetched_at': 'invalid'},
+            {'fetched_at': datetime.now().isoformat()},
+            {'fetched_at': (datetime.now(timezone.utc)-timedelta(minutes=11)).isoformat()},
+            {'fetched_at': (datetime.now(timezone.utc)+timedelta(minutes=5)).isoformat()},
+        ]
+        original = self.payload.copy()
+        for changes in cases:
+            self.payload = {**original, **changes}
+            with self.subTest(changes=changes), patch('fetcher.requests.get', return_value=self.bridge_response()):
+                with self.assertRaises(fetcher.FetchError):
+                    fetcher.fetch_google_bridge(print)
+
+    def test_oversized_response_fails(self):
+        r = self.bridge_response()
+        r.content = b'x' * 5_000_001
+        with patch('fetcher.requests.get', return_value=r), self.assertRaises(fetcher.FetchError):
+            fetcher.fetch_google_bridge(print)
+
+    def test_invalid_deployment_urls_fail_before_network(self):
+        for url in ['', 'http://script.google.com/macros/s/test/exec',
+                    'https://script.google.com/macros/s/test/dev',
+                    'https://evil.example/macros/s/test/exec',
+                    'https://script.google.com@evil.example/macros/s/test/exec',
+                    'https://script.google.com/macros/s/test/exec?key=secret']:
+            os.environ['GOOGLE_APPS_SCRIPT_URL'] = url
+            with self.subTest(url=url), patch('fetcher.requests.get') as get:
+                with self.assertRaises(fetcher.FetchError):
+                    fetcher.fetch_google_bridge(print)
+                get.assert_not_called()
+
+    def test_network_errors_do_not_expose_deployment_url(self):
+        with patch('fetcher.requests.get', side_effect=requests.ConnectionError(os.environ['GOOGLE_APPS_SCRIPT_URL'])):
+            with self.assertRaises(fetcher.FetchError) as caught:
+                fetcher.fetch_google_bridge(print)
+        self.assertNotIn('example-deployment', str(caught.exception))
 
 
 class DeliveryTests(Isolated):

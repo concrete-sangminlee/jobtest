@@ -2,7 +2,11 @@
 
 하이브레인 최신 채용 목록을 확인해 Slack으로 보내는 Python 3.12 작업입니다.
 ScraperAPI나 유료 프록시 키를 사용하지 않습니다. 공식 주소 `hibrain.net`과 `www.hibrain.net`의 직접 HTTP 요청을 먼저 시도하고,
-실패하면 Playwright Chromium으로 페이지를 읽습니다.
+실패하면 설정된 Google Apps Script 연결을 시도하고, 마지막으로 Playwright Chromium으로 페이지를 읽습니다.
+
+PC 없이 다른 무료 실행 경로를 사용하려면 [Google Apps Script 연결 안내](google-apps-script/README.md)를 참고하세요.
+Google 프로젝트는 공개 목록만 읽고, 기존 GitHub 예약 실행과 Slack 전송 설정은 유지합니다.
+Google에서 실제 접속이 되는지 `testConnection` 검증을 먼저 통과해야 합니다.
 
 **사이트가 실행 서버의 IP를 차단하면 브라우저도 실패할 수 있습니다.**
 무료 브라우저 실행은 접속 성공을 보장하지 않습니다. 이 경우 아래의 개인 기기 실행을
@@ -18,6 +22,9 @@ python -m playwright install --with-deps chromium
 python -m unittest discover -s tests -v
 python scraper.py --dry-run --report run_summary.json
 ```
+
+Google 연결 코드 자체의 모의 테스트는 Node.js 22에서 `node --test tests/test_google_bridge.cjs`로 실행합니다.
+이 테스트는 외부 서비스에 접속하지 않습니다.
 
 `--dry-run`은 실제 수집과 모든 메시지 묶음 생성을 검증하며, Slack 전송이나 상태 변경을 하지 않습니다.
 수집 실패·빈 목록·구조 변경은 종료 코드 1입니다. 신규 공고가 없어도 정상 수집이면 성공입니다.
@@ -80,7 +87,8 @@ GitHub 스케줄을 유지하려면 전용 기기에 self-hosted runner를 설�
 | 변수 | 기본값 | 설명 |
 |---|---|---|
 | `SLACK_WEBHOOK_URL` | 없음 | 실제 전송에 필수; dry-run에서는 필요 없음 |
-| `FETCH_MODE` | `auto` | `auto`, `http`, `browser` |
+| `FETCH_MODE` | `auto` | `auto`, `http`, `browser`, `google` |
+| `GOOGLE_APPS_SCRIPT_URL` | 없음 | 선택: 사용자가 배포한 공개 Google 웹앱 `/exec` 주소 |
 | `FETCH_MAX_ATTEMPTS` | `3` | 직접 요청 최대 횟수, 1~5 |
 | `DIRECT_TIMEOUT` | `30` | HTTP 제한 초, 1~120 |
 | `BROWSER_TIMEOUT` | `45` | 브라우저 탐색/목록 대기 각각의 제한 초, 1~120 |

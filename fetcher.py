@@ -127,10 +127,44 @@ def fetch_browser(log):
         raise FetchError(f"브라우저 수집 실패 ({type(exc).__name__}); Chromium 설치·네트워크·사이트 응답을 확인하세요.") from None
 
 
+def fetch_google_bridge(log):
+    """Fetch public listing HTML from a user-deployed, fixed-target Apps Script."""
+    url = os.environ.get("GOOGLE_APPS_SCRIPT_URL", "").strip()
+    parsed = urlsplit(url)
+    if (parsed.scheme != "https" or parsed.netloc != "script.google.com"
+            or not re.fullmatch(r"/macros/s/[A-Za-z0-9_-]+/exec", parsed.path)
+            or parsed.query or parsed.fragment):
+        raise FetchError("GOOGLE_APPS_SCRIPT_URL에는 배포한 Google 웹앱의 https://script.google.com/macros/s/.../exec 주소를 입력하세요.")
+    try:
+        response = requests.get(url, timeout=60)
+        response.raise_for_status()
+        if len(response.content) > 5_000_000:
+            raise ValueError("oversized response")
+        payload = response.json()
+        if not isinstance(payload, dict) or payload.get("ok") is not True:
+            raise ValueError("bridge could not collect")
+        if payload.get("version") != 1 or payload.get("source") != LIST_URL:
+            raise ValueError("unexpected source")
+        fetched_at = datetime.fromisoformat(payload["fetched_at"].replace("Z", "+00:00"))
+        age = (datetime.now(timezone.utc) - fetched_at).total_seconds()
+        if not -60 <= age <= 600:
+            raise ValueError("stale response")
+        html = payload["html"]
+        if not isinstance(html, str) or not valid_listing(html):
+            raise ValueError("invalid listing")
+    except (requests.RequestException, ValueError, TypeError, KeyError, AttributeError) as exc:
+        # Never dump responses, deployment URLs, or exception request URLs.
+        raise FetchError(f"Google 수집 연결 실패 ({type(exc).__name__}): 웹앱 공개 배포 설정과 testConnection 실행 결과를 확인하세요.") from None
+    log("수집 성공: Google Apps Script")
+    return html
+
+
 def fetch_page(log=print):
     mode = os.environ.get("FETCH_MODE", "auto")
-    if mode not in {"auto", "http", "browser"}:
-        raise ValueError("FETCH_MODE must be auto, http, or browser")
+    if mode not in {"auto", "http", "browser", "google"}:
+        raise ValueError("FETCH_MODE must be auto, http, browser, or google")
+    if mode == "google":
+        return fetch_google_bridge(log)
     if mode in {"auto", "http"}:
         try:
             html = fetch_http(log)
@@ -139,7 +173,12 @@ def fetch_page(log=print):
         except FetchError:
             if mode == "http":
                 raise
-            log("직접 요청 실패. 무료 Chromium 브라우저로 확인합니다.")
+            log("직접 요청 실패. 다음 수집 경로로 확인합니다.")
+    if mode == "auto" and os.environ.get("GOOGLE_APPS_SCRIPT_URL", "").strip():
+        try:
+            return fetch_google_bridge(log)
+        except FetchError as exc:
+            log(str(exc))
     html = fetch_browser(log)
     log("수집 성공: Chromium")
     return html

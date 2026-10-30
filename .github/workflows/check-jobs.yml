@@ -9,6 +9,10 @@ on:
         description: "수집만 검증 (Slack 전송·상태 변경 없음)"
         type: boolean
         default: true
+      google_apps_script_url:
+        description: "Google 연결 검증용 공개 웹앱 /exec 주소 (선택; 입력 시 Google 경로 사용)"
+        type: string
+        default: ""
       runner:
         description: "검증 실행 환경 (configured: 저장소 JOB_RUNNER 설정 사용)"
         type: choice
@@ -56,7 +60,8 @@ jobs:
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           DRY_RUN: ${{ inputs.dry_run || false }}
-          FETCH_MODE: ${{ vars.FETCH_MODE || 'auto' }}
+          FETCH_MODE: ${{ inputs.google_apps_script_url && 'google' || vars.FETCH_MODE || 'auto' }}
+          GOOGLE_APPS_SCRIPT_URL: ${{ inputs.google_apps_script_url || vars.GOOGLE_APPS_SCRIPT_URL }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         shell: bash
         run: |
