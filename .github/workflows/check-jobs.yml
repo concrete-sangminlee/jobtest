@@ -9,6 +9,14 @@ on:
         description: "수집만 검증 (Slack 전송·상태 변경 없음)"
         type: boolean
         default: true
+      runner:
+        description: "검증 실행 환경 (configured: 저장소 JOB_RUNNER 설정 사용)"
+        type: choice
+        default: configured
+        options:
+          - configured
+          - ubuntu-latest
+          - macos-latest
 
 concurrency:
   group: hibrain-delivery-${{ github.ref }}
@@ -19,7 +27,7 @@ permissions:
 
 jobs:
   check-jobs:
-    runs-on: ${{ fromJSON(vars.JOB_RUNNER || '"ubuntu-latest"') }}
+    runs-on: ${{ inputs.runner != 'configured' && inputs.runner || fromJSON(vars.JOB_RUNNER || '"ubuntu-latest"') }}
     timeout-minutes: 15
     permissions:
       contents: write
