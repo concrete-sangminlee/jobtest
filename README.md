@@ -1,7 +1,7 @@
 # HiBrain Job Alert
 
 하이브레인 최신 채용 목록을 확인해 Slack으로 보내는 Python 3.12 작업입니다.
-ScraperAPI나 유료 프록시 키를 사용하지 않습니다. 직접 HTTP 요청을 먼저 시도하고,
+ScraperAPI나 유료 프록시 키를 사용하지 않습니다. 공식 주소 `hibrain.net`과 `www.hibrain.net`의 직접 HTTP 요청을 먼저 시도하고,
 실패하면 Playwright Chromium으로 페이지를 읽습니다.
 
 **사이트가 실행 서버의 IP를 차단하면 브라우저도 실패할 수 있습니다.**

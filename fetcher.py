@@ -52,13 +52,22 @@ def valid_listing(html):
 
 
 def fetch_http(log):
+    for url in (LIST_URL, LIST_URL.replace("https://hibrain.net", "https://www.hibrain.net")):
+        try:
+            return _fetch_http_url(url, log)
+        except FetchError:
+            continue
+    raise FetchError("공식 주소 두 곳 모두 유효한 채용 목록을 반환하지 않았습니다.")
+
+
+def _fetch_http_url(url, log):
     attempts = positive_int("FETCH_MAX_ATTEMPTS", 3, 5)
     timeout = positive_int("DIRECT_TIMEOUT", 30, 120)
     for attempt in range(1, attempts + 1):
         delay = 2 ** attempt
         try:
             response = requests.get(
-                LIST_URL,
+                url,
                 headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "ko-KR,ko;q=0.9"},
                 timeout=timeout,
             )
@@ -68,7 +77,7 @@ def fetch_http(log):
         else:
             if response.status_code == 200 and valid_listing(response.text):
                 return response.text
-            log(f"직접 요청 {attempt}/{attempts}: HTTP {response.status_code}, 유효한 채용 목록 없음")
+            log(f"{urlsplit(url).hostname} 직접 요청 {attempt}/{attempts}: HTTP {response.status_code}, 유효한 채용 목록 없음")
             if response.status_code != 429 and response.status_code < 500:
                 break  # Auth failures, blocks, and changed markup won't improve by repeating.
             delay = retry_delay(response.headers.get("Retry-After"), attempt)

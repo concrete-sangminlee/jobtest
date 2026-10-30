@@ -87,8 +87,14 @@ class FetchTests(Isolated):
     def test_block_falls_back_without_three_identical_requests(self):
         with patch('fetcher.requests.get', return_value=response(403)) as get, patch('fetcher.fetch_browser', return_value=HTML) as browser:
             self.assertEqual(fetcher.fetch_page(), HTML)
-            self.assertEqual(get.call_count, 1)
+            self.assertEqual(get.call_count, 2)  # One request per official hostname.
             browser.assert_called_once()
+
+    def test_www_official_address_can_recover_primary_block(self):
+        with patch('fetcher.requests.get', side_effect=[response(403), response(text=HTML)]) as get, patch('fetcher.fetch_browser') as browser:
+            self.assertEqual(fetcher.fetch_page(), HTML)
+            self.assertEqual(get.call_args.args[0].split('/')[2], 'www.hibrain.net')
+            browser.assert_not_called()
 
     def test_transient_failure_retries(self):
         with patch('fetcher.requests.get', side_effect=[response(503), response(text=HTML)]) as get, patch('fetcher.time.sleep'):
