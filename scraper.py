@@ -295,6 +295,13 @@ def main(argv=None):
         report = {"status": "failed", "dry_run": args.dry_run,
                   "error": str(exc) if isinstance(exc, (ValueError, RuntimeError)) else type(exc).__name__}
     write_report(report, args.report)
+    detail = report.get("error") or f"수집 {report.get('collected', 0)}건, 전송 {report.get('delivered', 0)}건, 실패 채널 {report.get('failed_channels', 0)}개, 대기 {report.get('pending', 0)}건"
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        escaped = detail.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        level = "error" if report["status"] == "failed" else "notice"
+        print(f"::{level}::{escaped}")
+    else:
+        log(detail)
     log(f"실행 결과: {report['status']}")
     return 0 if report["status"] == "success" else 1
 

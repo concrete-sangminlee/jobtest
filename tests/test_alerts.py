@@ -229,6 +229,14 @@ class DeliveryTests(Isolated):
 
 
 class CliTests(Isolated):
+    def test_failure_annotation_explains_cause_without_log_download(self):
+        os.environ['GITHUB_ACTIONS'] = 'true'
+        output = io.StringIO()
+        with patch('scraper.fetch_page', side_effect=fetcher.FetchError('blocked\nHTTP 403')), contextlib.redirect_stdout(output):
+            code = scraper.main(['--dry-run', '--state-file', str(self.path)])
+        self.assertEqual(code, 1)
+        self.assertIn('::error::blocked%0AHTTP 403', output.getvalue())
+
     def test_dry_run_fetches_and_never_writes_or_sends(self):
         self.path.write_text('["9"]')
         with patch('scraper.fetch_page', return_value=HTML), patch('delivery.requests.post') as post:
