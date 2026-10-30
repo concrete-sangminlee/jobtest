@@ -113,6 +113,8 @@ def fetch_browser(log):
             finally:
                 browser.close()
     except Error as exc:
+        if "ERR_CERT_AUTHORITY_INVALID" in str(exc):
+            raise FetchError("브라우저 TLS 인증서 검증 실패: 실행 환경에 신뢰할 CA를 설치하세요. 인증서 검증을 끄지 마세요.") from None
         raise FetchError(f"브라우저 수집 실패 ({type(exc).__name__}); Chromium 설치·네트워크·사이트 응답을 확인하세요.") from None
 
 
