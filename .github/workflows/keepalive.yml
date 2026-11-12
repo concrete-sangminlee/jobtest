@@ -2,18 +2,23 @@ name: Keepalive Workflow
 
 on:
   schedule:
-    - cron: "0 0 1 * *" # 매월 1일 자정 (60일 비활성화 방지)
+    - cron: "23 3 1,15 * *"
   workflow_dispatch:
+
+permissions:
+  actions: write
 
 jobs:
   keepalive:
     runs-on: ubuntu-latest
-    permissions:
-      actions: write
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Keepalive - prevent scheduled workflow disable
-        uses: gautamkrishnar/keepalive-workflow@v2
-        with:
-          time_elapsed: 50
+      # 공개 저장소는 60일간 활동이 없으면 예약 워크플로가 꺼진다. 서드파티 액션 없이 API로 다시 켠다.
+      - name: Re-enable scheduled workflows
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for wf in check-jobs.yml keepalive.yml; do
+            gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/enable"
+            echo "enabled: ${wf}"
+          done
