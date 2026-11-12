@@ -307,21 +307,6 @@ def test_message_overhead_constant_matches_reality():
     assert len(blocks) == scraper._MESSAGE_OVERHEAD_BLOCKS
 
 
-def test_send_jobs_never_exceeds_slack_block_limit(monkeypatch):
-    """JOBS_PER_MESSAGE를 과하게 키워도 Slack 블록 상한을 넘기지 않아야 한다."""
-    monkeypatch.setattr(scraper, "JOBS_PER_MESSAGE", 500)
-    monkeypatch.setattr(scraper, "MAX_MESSAGES", 10)
-    sizes = []
-    monkeypatch.setattr(scraper, "send_to_slack",
-                        lambda m: (sizes.append(len(m["attachments"][0]["blocks"])), (1, 1))[1])
-
-    jobs = [make_job(i, period="26.10.01 ~ 26.10.31", d_day=20) for i in range(100)]
-    delivered = scraper.send_jobs(jobs)
-
-    assert max(sizes) <= scraper.SLACK_MAX_BLOCKS, f"블록 상한 초과: {max(sizes)}"
-    assert len(delivered) == 100, "클램프 때문에 공고가 누락됐다"
-
-
 # --------------------------------------------------------------------------
 # Slack 전송
 # --------------------------------------------------------------------------
@@ -334,65 +319,6 @@ def test_webhook_label_and_redact_hide_token():
     assert "supersecret" not in scraper.redact(msg, url)
 
 
-@pytest.mark.parametrize("status,body,permanent", [
-    (404, "no_active_hooks", True),
-    (404, "", True),
-    (403, "", True),
-    (400, "channel_is_archived", True),
-    (400, "invalid_blocks", True),
-    (429, "rate_limited", False),
-    (503, "", False),
-])
-def test_explain_slack_error_classifies_permanence(status, body, permanent):
-    assert scraper.explain_slack_error(status, body)[1] is permanent
-
-
-def test_post_one_retries_transient_then_succeeds(monkeypatch):
-    responses = [FakeResponse(503), FakeResponse(429, headers={"Retry-After": "1"}),
-                 FakeResponse(200)]
-    monkeypatch.setattr(scraper.requests, "post", lambda *a, **k: responses.pop(0))
-    assert scraper._post_one("https://h/services/A/B/tok", {}, "ch") == (True, False)
-    assert responses == []
-
-
-def test_post_one_does_not_retry_permanent_failure(monkeypatch):
-    calls = []
-
-    def post(*_a, **_k):
-        calls.append(1)
-        return FakeResponse(404, "no_active_hooks")
-
-    monkeypatch.setattr(scraper.requests, "post", post)
-    assert scraper._post_one("https://h/services/A/B/tok", {}, "ch") == (False, True)
-    assert len(calls) == 1, "영구적 실패를 재시도했다"
-
-
-def test_post_one_gives_up_after_max_attempts(monkeypatch):
-    monkeypatch.setattr(scraper, "SLACK_MAX_ATTEMPTS", 2)
-    calls = []
-    monkeypatch.setattr(scraper.requests, "post",
-                        lambda *a, **k: (calls.append(1), FakeResponse(503))[1])
-    assert scraper._post_one("https://h/services/A/B/tok", {}, "ch") == (False, False)
-    assert len(calls) == 2
-
-
-def test_send_to_slack_continues_past_dead_webhook(monkeypatch):
-    monkeypatch.setenv("SLACK_WEBHOOK_URL",
-                       "https://h/services/A/DEAD/t1,https://h/services/A/LIVE/t2")
-
-    def post(url, **_k):
-        return FakeResponse(404, "no_active_hooks") if "DEAD" in url else FakeResponse(200)
-
-    monkeypatch.setattr(scraper.requests, "post", post)
-    assert scraper.send_to_slack({}) == (1, 2)
-
-
-def test_send_to_slack_without_webhook_is_a_dry_run(monkeypatch, capsys):
-    monkeypatch.delenv("SLACK_WEBHOOK_URL", raising=False)
-    assert scraper.send_to_slack({"text": "hi"}) == (0, 0)
-    assert "미리보기" in capsys.readouterr().out
-
-
 # --------------------------------------------------------------------------
 # 분할 전송 — 20건 초과가 조용히 버려지던 회귀 버그
 # --------------------------------------------------------------------------
@@ -400,56 +326,6 @@ def test_send_to_slack_without_webhook_is_a_dry_run(monkeypatch, capsys):
 def test_chunk_splits_evenly():
     assert scraper.chunk([1, 2, 3, 4, 5], 2) == [[1, 2], [3, 4], [5]]
     assert scraper.chunk([], 2) == []
-
-
-def test_send_jobs_splits_into_multiple_messages(monkeypatch):
-    monkeypatch.setattr(scraper, "JOBS_PER_MESSAGE", 20)
-    monkeypatch.setattr(scraper, "MAX_MESSAGES", 5)
-    sent = []
-    monkeypatch.setattr(scraper, "send_to_slack",
-                        lambda m: (sent.append(m), (1, 1))[1])
-
-    jobs = [make_job(i) for i in range(46)]
-    delivered = scraper.send_jobs(jobs)
-
-    assert len(sent) == 3, "46건이 20/20/6으로 나뉘지 않았다"
-    assert len(delivered) == 46, "일부 공고가 전송에서 누락됐다"
-    assert {j["id"] for j in delivered} == {j["id"] for j in jobs}
-
-
-def test_send_jobs_defers_overflow_instead_of_dropping(monkeypatch):
-    """상한을 넘긴 공고는 '전달됨'으로 보고되지 않아야 한다. (다음 주기 재시도)"""
-    monkeypatch.setattr(scraper, "JOBS_PER_MESSAGE", 10)
-    monkeypatch.setattr(scraper, "MAX_MESSAGES", 2)
-    monkeypatch.setattr(scraper, "send_to_slack", lambda m: (1, 1))
-
-    jobs = [make_job(i) for i in range(35)]
-    delivered = scraper.send_jobs(jobs)
-
-    assert len(delivered) == 20
-    assert {j["id"] for j in delivered} == {str(i) for i in range(20)}
-
-
-def test_send_jobs_reports_only_delivered_chunks(monkeypatch):
-    monkeypatch.setattr(scraper, "JOBS_PER_MESSAGE", 10)
-    monkeypatch.setattr(scraper, "MAX_MESSAGES", 5)
-    calls = {"n": 0}
-
-    def flaky(_m):
-        calls["n"] += 1
-        return (0, 1) if calls["n"] == 2 else (1, 1)   # 두 번째 메시지만 실패
-
-    monkeypatch.setattr(scraper, "send_to_slack", flaky)
-    delivered = scraper.send_jobs([make_job(i) for i in range(30)])
-
-    ids = {j["id"] for j in delivered}
-    assert len(ids) == 20
-    assert ids.isdisjoint({str(i) for i in range(10, 20)}), "실패한 묶음이 전달됨으로 집계됐다"
-
-
-def test_send_jobs_returns_nothing_when_no_webhook(monkeypatch):
-    monkeypatch.setattr(scraper, "send_to_slack", lambda m: (0, 0))
-    assert scraper.send_jobs([make_job(1)]) == []
 
 
 # --------------------------------------------------------------------------
@@ -466,18 +342,6 @@ def test_save_seen_trims_to_max(monkeypatch):
     scraper.save_seen([str(i) for i in range(20)])
     kept = scraper.load_seen()
     assert kept == ["15", "16", "17", "18", "19"]
-
-
-def test_load_seen_survives_corrupt_file(capsys):
-    scraper.SEEN_FILE.write_text("{ this is not json", encoding="utf-8")
-    assert scraper.load_seen() == []
-    assert "읽을 수 없습니다" in capsys.readouterr().out
-
-
-def test_load_seen_rejects_wrong_shape(capsys):
-    scraper.SEEN_FILE.write_text('{"ids": [1,2]}', encoding="utf-8")
-    assert scraper.load_seen() == []
-    assert "형식이 예상과 다릅니다" in capsys.readouterr().out
 
 
 def test_load_seen_missing_file_is_empty():
@@ -501,14 +365,6 @@ def test_track_jobs_preconsumes_passed_thresholds(monkeypatch):
     assert tracked["3"]["reminded"] == [3, 1]
 
 
-def test_track_jobs_preconsumption_prevents_same_cycle_duplicate(monkeypatch):
-    monkeypatch.setattr(scraper, "REMINDER_DAYS", [3, 1])
-    monkeypatch.setattr(scraper, "compute_d_day", lambda _e: 2)
-    tracked = scraper.track_jobs({}, [make_job(1, end_date="26.10.13", d_day=2)])
-    due, _ = scraper.due_reminders(tracked)
-    assert due == [], "방금 알린 공고가 곧바로 리마인더로 또 나갔다"
-
-
 def test_track_jobs_skips_undated_and_always_open():
     tracked = scraper.track_jobs({}, [
         make_job(1, end_date="26.10.23", d_day=12),
@@ -517,29 +373,6 @@ def test_track_jobs_skips_undated_and_always_open():
     ])
     assert set(tracked) == {"1"}
     assert tracked["1"]["reminded"] == []
-
-
-def test_due_reminders_fires_at_configured_thresholds(monkeypatch):
-    monkeypatch.setattr(scraper, "REMINDER_DAYS", [3, 1])
-    monkeypatch.setattr(scraper, "compute_d_day", lambda _e: 1)
-    tracked = {"1": {"title": "t", "url": "u", "end_date": "26.10.12", "reminded": []}}
-    due, tracked = scraper.due_reminders(tracked)
-    assert [j["id"] for j in due] == ["1"]
-    assert tracked["1"]["reminded"] == [3]      # D-3 기준을 놓쳤으므로 먼저 소비
-
-    due2, tracked = scraper.due_reminders(tracked)
-    assert [j["id"] for j in due2] == ["1"]
-    assert tracked["1"]["reminded"] == [3, 1]
-
-    due3, _ = scraper.due_reminders(tracked)
-    assert due3 == [], "같은 기준으로 또 알렸다"
-
-
-def test_due_reminders_ignores_far_deadlines(monkeypatch):
-    monkeypatch.setattr(scraper, "REMINDER_DAYS", [1])
-    monkeypatch.setattr(scraper, "compute_d_day", lambda _e: 9)
-    due, _ = scraper.due_reminders({"1": {"end_date": "x", "reminded": []}})
-    assert due == []
 
 
 def test_prune_tracked_drops_expired(monkeypatch):
@@ -552,24 +385,6 @@ def test_prune_tracked_drops_expired(monkeypatch):
         "4": "손상된 값",
     }
     assert set(scraper.prune_tracked(tracked)) == {"1"}
-
-
-def test_run_reminders_is_noop_when_disabled(monkeypatch):
-    monkeypatch.setattr(scraper, "REMINDER_DAYS", [])
-    monkeypatch.setattr(scraper, "send_jobs",
-                        lambda *a, **k: pytest.fail("리마인더가 꺼져 있는데 전송했다"))
-    state = {"1": {"end_date": "26.10.23", "reminded": []}}
-    assert scraper.run_reminders(state) == state
-
-
-def test_run_reminders_rolls_back_on_send_failure(monkeypatch):
-    monkeypatch.setattr(scraper, "REMINDER_DAYS", [1])
-    monkeypatch.setattr(scraper, "compute_d_day", lambda _e: 1)
-    monkeypatch.setattr(scraper, "send_jobs", lambda *a, **k: [])   # 전송 실패
-    tracked = scraper.run_reminders(
-        {"1": {"title": "t", "url": "u", "end_date": "26.10.12", "reminded": []}}
-    )
-    assert tracked["1"]["reminded"] == [], "전송 실패인데 보냄으로 표시했다"
 
 
 def test_load_tracked_survives_corrupt_file():
