@@ -2,85 +2,160 @@ name: Check hibrain.net Job Postings
 
 on:
   schedule:
-    # 하루 3회 (KST 기준) — GitHub Actions cron은 UTC 기준.
-    # 정각(:00)은 큐가 붐벼 지연이 크므로 :07로 살짝 비켜 예약.
-    - cron: "7 0 * * *"  # 09:07 KST
+    # GitHub Actions cron은 UTC 기준. 실제 시작은 몇 시간씩 늦어질 수 있다(보장 없음).
+    - cron: "7 0 * * *"  # 09:07 KST (예정 시각)
     - cron: "7 5 * * *"  # 14:07 KST
     - cron: "7 10 * * *" # 19:07 KST
   workflow_dispatch:
     inputs:
-      test_mode:
-        description: "테스트 모드 (샘플 공고를 Slack 전송)"
-        type: boolean
-        default: false
+      mode:
+        description: "dry-run: 수집·메시지 생성만(전송·상태 변경 없음) / test-message: 샘플을 Slack에 전송 / live: 실제 알림"
+        type: choice
+        default: dry-run
+        options:
+          - dry-run
+          - test-message
+          - live
 
-# 두 실행이 겹치면 상태 파일 커밋이 서로 밀어낸다. 한 번에 하나만 돌린다.
+permissions:
+  contents: read
+
+# 상태 파일을 쓰는 실행(live)은 브랜치당 하나씩만. 읽기 전용 수동 실행은 다른 그룹이라
+# 대기 중인 예약 실행을 밀어내지 않는다.
 concurrency:
-  group: check-jobs
+  group: check-jobs-${{ github.ref }}-${{ (github.event_name == 'schedule' || inputs.mode == 'live') && 'live' || 'readonly' }}
   cancel-in-progress: false
+
+env:
+  PYTHONUTF8: "1"
+  # 예약 실행만 자동으로 live. 수동 실행에서 값이 비면 안전한 쪽(dry-run)으로 떨어진다.
+  RUN_MODE: ${{ github.event_name == 'schedule' && 'live' || inputs.mode || 'dry-run' }}
 
 jobs:
   check-jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-
     permissions:
       contents: write
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Slack으로 나가는 실행은 기본 브랜치에서만 허용
+        if: ${{ github.event_name == 'workflow_dispatch' && env.RUN_MODE != 'dry-run' && github.ref_name != github.event.repository.default_branch }}
+        run: |
+          echo "::error title=브랜치 제한::'${RUN_MODE}' 실행은 기본 브랜치에서만 허용됩니다. 개발 브랜치에서는 dry-run을 사용하세요."
+          exit 1
+
+      - name: Checkout repository (branch tip, not the event SHA)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.ref_name }}
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: requirements.txt
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: python -m pip install -r requirements.txt
 
       - name: Run scraper
+        id: scrape
+        timeout-minutes: 12
         env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          # dry-run에는 웹훅을 아예 넘기지 않는다.
+          SLACK_WEBHOOK_URL: ${{ env.RUN_MODE != 'dry-run' && secrets.SLACK_WEBHOOK_URL || '' }}
+          # 선택: 봇 상태 경보(수집 실패/복구)를 받을 별도 채널. 없으면 공고 채널로 보낸다.
+          SLACK_ALERT_WEBHOOK_URL: ${{ env.RUN_MODE != 'dry-run' && secrets.SLACK_ALERT_WEBHOOK_URL || '' }}
+          # 선택: 유료/무료 프록시 키. 비어 있으면 직접 요청만 한다.
           SCRAPER_API_KEY: ${{ secrets.SCRAPER_API_KEY }}
-          TEST_MODE: ${{ inputs.test_mode }}
-          # 아래는 모두 선택 사항. 저장소 Variables에서 코드 수정 없이 조절한다.
-          # (Settings → Secrets and variables → Actions → Variables)
-          REMINDER_DAYS: ${{ vars.REMINDER_DAYS }}            # 예: "3,1" — 비우면 리마인더 꺼짐
+          REMINDER_DAYS: ${{ vars.REMINDER_DAYS }}
           JOB_INCLUDE_KEYWORDS: ${{ vars.JOB_INCLUDE_KEYWORDS }}
           JOB_EXCLUDE_KEYWORDS: ${{ vars.JOB_EXCLUDE_KEYWORDS }}
-          ENRICH: ${{ vars.ENRICH }}                          # "false"로 상세 보강 끄기
+          ENRICH: ${{ vars.ENRICH }}
           JOBS_PER_MESSAGE: ${{ vars.JOBS_PER_MESSAGE }}
           MAX_MESSAGES: ${{ vars.MAX_MESSAGES }}
-        run: python scraper.py
+        run: python scraper.py --mode "$RUN_MODE" --report run_summary.json
+
+      - name: Snapshot state files (before any git operation)
+        id: snapshot
+        if: ${{ always() && steps.scrape.outcome != '' && steps.scrape.outcome != 'skipped' }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/job-alert"
+          for f in run_summary.json seen_jobs.json tracked_jobs.json outbox.json health.json; do
+            if [ -f "$f" ]; then cp -p "$f" "$RUNNER_TEMP/job-alert/"; fi
+          done
+
+      - name: Upload diagnostics and recovery copy
+        if: ${{ always() && steps.snapshot.outcome == 'success' }}
+        continue-on-error: true  # artifact 서비스 장애가 정상 실행을 실패로 만들지 않게
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: job-alert-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/job-alert/
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Commit updated state
-        if: always()
+        id: persist
+        if: ${{ always() && env.RUN_MODE == 'live' && steps.scrape.outcome != '' && steps.scrape.outcome != 'skipped' }}
         run: |
+          set -euo pipefail
+          state_files=(seen_jobs.json tracked_jobs.json outbox.json health.json)
+          present=()
+          for f in "${state_files[@]}"; do
+            [ -f "$f" ] || continue
+            # 깨진 상태 파일은 절대 커밋하지 않는다.
+            if ! python -c 'import json,sys; json.load(open(sys.argv[1], encoding="utf-8"))' "$f"; then
+              echo "::error title=상태 파일 손상::$f 가 올바른 JSON이 아니어서 커밋하지 않았습니다. 실행 artifact의 사본을 확인하세요."
+              exit 1
+            fi
+            present+=("$f")
+          done
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          git add seen_jobs.json
-          if [ -f tracked_jobs.json ]; then git add tracked_jobs.json; fi
-
+          git add -- "${present[@]}"
           if git diff --staged --quiet; then
             echo "상태 변경 없음 — 커밋 생략"
             exit 0
           fi
-          git commit -m "Update job state"
-
-          # 다른 실행이 먼저 푸시했을 수 있으니 리베이스 후 재시도한다.
-          for attempt in 1 2 3; do
-            if git push; then
+          git commit -q -m "Update job state"
+          for attempt in 1 2 3 4; do
+            if git push origin "HEAD:${GITHUB_REF_NAME}"; then
               echo "푸시 완료 (시도 $attempt)"
               exit 0
             fi
+            [ "$attempt" = 4 ] && break
             echo "푸시 실패 — 원격 변경을 가져와 리베이스 후 재시도 ($attempt/3)"
-            git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
+            if ! git pull --rebase origin "${GITHUB_REF_NAME}"; then
+              git rebase --abort || true
+              echo "::error title=상태 푸시 실패::원격의 상태 파일과 충돌했습니다. 다음 실행에서 중복 알림될 수 있습니다. 실행 artifact의 상태 파일로 복구하세요."
+              exit 1
+            fi
             sleep $((attempt * 3))
           done
-
-          echo "::error::상태 파일을 푸시하지 못했습니다. 다음 실행에서 공고가 중복 알림될 수 있습니다."
+          echo "::error title=상태 푸시 실패::상태 파일을 푸시하지 못했습니다. 다음 실행에서 중복 알림될 수 있습니다. 실행 artifact의 상태 파일로 복구하세요."
           exit 1
+
+      # 스크레이퍼가 스스로 보고하지 못한 실패(설치 실패, 시간 초과, 상태 푸시 실패 등)를 Slack에 알린다.
+      - name: Notify Slack about failures the scraper could not report itself
+        if: ${{ failure() && env.RUN_MODE == 'live' && (steps.scrape.outputs.failure_reported != 'true' || steps.persist.outcome == 'failure') }}
+        env:
+          HOOKS: ${{ secrets.SLACK_ALERT_WEBHOOK_URL || secrets.SLACK_WEBHOOK_URL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          FAILED_AT: ${{ steps.persist.outcome == 'failure' && '상태 저장 실패 — 중복 알림 가능' || steps.scrape.outcome == 'failure' && '수집/전송 단계' || '실행 준비 단계' }}
+        run: |
+          payload=$(python3 -c 'import json,os; print(json.dumps({"text": "🚨 HiBrain 알림 봇 실행이 실패했습니다 (" + os.environ["FAILED_AT"] + "). 로그: " + os.environ["RUN_URL"]}))')
+          IFS=',' read -ra hooks <<< "$HOOKS"
+          sent=0; total=0
+          for h in "${hooks[@]}"; do
+            h="$(printf '%s' "$h" | tr -d '[:space:]')"
+            [ -n "$h" ] || continue
+            total=$((total + 1))
+            if curl -fsS -o /dev/null --max-time 15 -H 'Content-Type: application/json' --data "$payload" "$h" 2>/dev/null; then
+              sent=$((sent + 1))
+            fi
+          done
+          echo "실패 알림 전송: ${sent}/${total} 채널"
+          if [ "$sent" -eq 0 ]; then echo "::warning::실패 알림을 어느 채널에도 보내지 못했습니다."; fi
