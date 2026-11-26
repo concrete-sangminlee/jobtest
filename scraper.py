@@ -85,6 +85,15 @@ ENRICH_MAX = _env_int("ENRICH_MAX", 30)
 OUTBOX_TTL_DAYS = _env_int("OUTBOX_TTL_DAYS", 3)
 OUTBOX_MAX_PENDING = _env_int("OUTBOX_MAX_PENDING", 500)
 
+# 목록(D3NEW)은 최근 3일치만 보여준다. 마지막 성공 후 이보다 오래 지나면 그 사이 공고가
+# 목록에서 빠져 영영 못 보게 된다. 그런 공백 뒤에는 진행 중 공고 목록(ING)을 몇 페이지
+# 더 읽어 메운다. 이 사이트는 봇을 반기지 않으므로 상한을 두고 천천히 읽는다.
+LIST_WINDOW_DAYS = 3
+CATCHUP_AFTER_HOURS = _env_int("CATCHUP_AFTER_HOURS", 60)
+CATCHUP_MAX_PAGES = _env_int("CATCHUP_MAX_PAGES", 20)
+CATCHUP_DELAY = _env_int("CATCHUP_DELAY", 2)
+CATCHUP_PAGE_SIZE = 25   # ING 목록 한 페이지의 공고 수 (사이트 고정값)
+
 # 수집 감시. 이 사이트는 실행 환경(러너 IP)에 따라 간헐적으로 접속을 거부한다.
 # 한두 번의 실패는 흔하므로 경고만 남기고, 마지막 성공 후 HEALTH_ALERT_HOURS가 지나면
 # 실행을 실패로 표시하고 Slack에 경보를 보낸다. 이후에는 HEALTH_REALERT_HOURS마다 한 번만.
@@ -295,19 +304,19 @@ _PERMANENT_HINTS = {
 }
 
 
-def _fetch_via_scraperapi(api_key: str) -> str:
+def _fetch_via_scraperapi(api_key: str, url: str = LIST_URL) -> str:
     # HTTPS 엔드포인트를 사용해 프록시 구간 신뢰성을 높인다.
-    url = (
+    proxied = (
         "https://api.scraperapi.com/"
-        f"?api_key={api_key}&url={quote(LIST_URL)}"
+        f"?api_key={api_key}&url={quote(url)}"
     )
-    resp = requests.get(url, timeout=SCRAPERAPI_TIMEOUT)
+    resp = requests.get(proxied, timeout=SCRAPERAPI_TIMEOUT)
     resp.raise_for_status()
     return resp.text
 
 
-def _fetch_direct() -> str:
-    resp = requests.get(LIST_URL, headers=BROWSER_HEADERS, timeout=DIRECT_TIMEOUT)
+def _fetch_direct(url: str = LIST_URL) -> str:
+    resp = requests.get(url, headers=BROWSER_HEADERS, timeout=DIRECT_TIMEOUT)
     resp.raise_for_status()
     return resp.text
 
@@ -317,16 +326,17 @@ def _hide_key(text: str) -> str:
     return re.sub(r"(api_key=)[^&\s]+", r"\1***", text)
 
 
-def _try_method(name: str, fetch_fn) -> tuple[Optional[str], str]:
+def _try_method(name: str, fetch_fn, attempts: int = 0) -> tuple[Optional[str], str]:
     """한 가지 방식(ScraperAPI 또는 직접)을 재시도와 함께 실행한다.
 
     (HTML, 실패 사유)를 반환한다. 성공하면 사유는 빈 문자열이다.
     401/403처럼 다시 해도 같은 응답은 재시도하지 않는다.
     """
+    attempts = attempts or MAX_ATTEMPTS
     reason = ""
-    for attempt in range(1, MAX_ATTEMPTS + 1):
+    for attempt in range(1, attempts + 1):
         try:
-            log(f"{name} 시도 {attempt}/{MAX_ATTEMPTS}...")
+            log(f"{name} 시도 {attempt}/{attempts}...")
             html = fetch_fn()
         except requests.HTTPError as e:
             status = e.response.status_code if e.response is not None else None
@@ -346,7 +356,7 @@ def _try_method(name: str, fetch_fn) -> tuple[Optional[str], str]:
             log(f"  {name} 응답에 채용 목록이 없습니다. (차단/빈 응답 가능성)")
             reason = f"{name} 응답에 채용 목록 없음"
 
-        if attempt < MAX_ATTEMPTS:
+        if attempt < attempts:
             wait = BACKOFF_BASE * attempt
             log(f"  {wait}초 후 재시도...")
             time.sleep(wait)
@@ -355,28 +365,29 @@ def _try_method(name: str, fetch_fn) -> tuple[Optional[str], str]:
     return None, reason
 
 
-def fetch_page() -> str:
-    """채용 목록 HTML을 가져온다.
-
-    ScraperAPI 키가 있으면 먼저 시도하고, 실패하면 직접 요청으로 폴백한다.
-    모두 실패하면 각 방식의 실패 사유를 담은 FetchError를 던진다.
-    """
+def _fetch_chain(url: str, attempts: int = 0) -> str:
+    """URL 하나를 ScraperAPI(키가 있으면) → 직접 요청 순서로 가져온다. 실패하면 FetchError."""
     reasons = []
     scraper_api_key = os.environ.get("SCRAPER_API_KEY", "").strip()
 
     if scraper_api_key:
-        html, reason = _try_method("ScraperAPI", lambda: _fetch_via_scraperapi(scraper_api_key))
+        html, reason = _try_method("ScraperAPI", lambda: _fetch_via_scraperapi(scraper_api_key, url), attempts)
         if html is not None:
             return html
         reasons.append(reason)
         log("ScraperAPI가 실패하여 직접 요청으로 폴백합니다.")
 
-    html, reason = _try_method("직접 요청", _fetch_direct)
+    html, reason = _try_method("직접 요청", lambda: _fetch_direct(url), attempts)
     if html is not None:
         return html
     reasons.append(reason)
 
     raise FetchError(" / ".join(r for r in reasons if r) or "모든 방식으로 페이지를 가져오지 못했습니다.")
+
+
+def fetch_page() -> str:
+    """신규 채용 목록(최근 3일) HTML을 가져온다. 실패하면 각 방식의 사유를 담은 FetchError."""
+    return _fetch_chain(LIST_URL)
 
 
 def _clean(text: str) -> str:
@@ -420,6 +431,10 @@ def parse_job_row(li) -> Optional[dict]:
     receipt_text = _clean(receipt_span.get_text(" ", strip=True)) if receipt_span else ""
     always_open = any(k in receipt_text for k in ("상시", "수시", "채용시"))
 
+    # 등록/수정일. 누락 보충 때 어디까지 읽을지 판단하는 데 쓴다.
+    registered_el = li.find("span", class_="td_rdtm")
+    registered = _clean(registered_el.get_text(strip=True)) if registered_el else ""
+
     return {
         "id": job_id,
         "title": title,
@@ -428,6 +443,7 @@ def parse_job_row(li) -> Optional[dict]:
         "end_date": end_date,
         "always_open": always_open,
         "d_day": compute_d_day(end_date) if end_date else None,
+        "registered": registered,
         # 보강 필드 (상세 페이지에서 채워짐)
         "org": "",
         "industry": "",
@@ -465,6 +481,82 @@ def scrape_jobs() -> list[dict]:
     if not jobs:
         raise FetchError("목록 페이지는 받았지만 공고를 하나도 파싱하지 못했습니다 (사이트 구조 변경 가능성).")
     return jobs
+
+
+# --------------------------------------------------------------------------
+# 누락 보충 — 목록 창(3일)보다 긴 공백 뒤에 진행 중 공고 목록을 더 읽는다
+# --------------------------------------------------------------------------
+
+def catchup_url(page: int) -> str:
+    # 사이트가 페이지 링크에 쓰는 형식을 그대로 쓴다.
+    return (f"{BASE_URL}/recruitment/recruits?page={page}&pagingno=1&listType=ING"
+            f"&pagesize=50&sortType=SORTDTM&limit={CATCHUP_PAGE_SIZE}&displayType=TIT&siteid=1")
+
+
+def needs_catchup(last_success: str) -> bool:
+    """마지막 성공이 목록 창을 거의 넘길 만큼 오래됐으면 True. 기록이 없으면 판단하지 않는다."""
+    if not last_success:
+        return False
+    hours = _hours_since(last_success)
+    return hours != float("inf") and hours >= CATCHUP_AFTER_HOURS
+
+
+def catch_up(last_success: str, recent_count: int, fetcher=None) -> tuple[list[dict], dict]:
+    """마지막 성공 무렵까지 진행 중 공고 목록을 거슬러 읽는다.
+
+    목록은 등록/수정일 최신순이다. 최근 3일치는 신규 목록이 이미 담고 있으므로 그 앞부분은
+    건너뛰고 시작한다. 진행 중 목록은 마감된 공고가 빠져 하루 공고 수가 신규 목록의 약 1/3이다
+    (2026-11 실측: 하루 약 37건 대 약 100건). 그래서 신규 목록 건수의 1/4 지점에서 시작해
+    일부러 3일 경계보다 앞에서 읽는다. 시작 페이지가 이미 3일보다 오래된 공고뿐이면 너무
+    멀리 간 것이니 1페이지부터 다시 읽는다. 마지막 성공일 하루 전보다 오래된 공고가 나오면
+    멈춘다. 차단되거나 CATCHUP_MAX_PAGES에 닿으면 그때까지 읽은 것만 쓴다.
+
+    (공고 목록, 보고용 정보)를 돌려준다.
+    """
+    fetch = fetcher or (lambda url: _fetch_chain(url, attempts=1))
+    since = _parse_date(last_success[:10].replace("-", "."))
+    cutoff = (since - timedelta(days=1)) if since else None
+    window_start = _today_kst() - timedelta(days=LIST_WINDOW_DAYS)
+    page = max(1, recent_count // (CATCHUP_PAGE_SIZE * 4))
+    restarted = page == 1
+    collected: list[dict] = []
+    info = {"pages": 0, "complete": False, "reason": "", "from": last_success}
+
+    log(f"마지막 성공({last_success}) 후 {CATCHUP_AFTER_HOURS}시간 넘게 지나 누락 보충을 시작합니다 "
+        f"(최대 {CATCHUP_MAX_PAGES}페이지).")
+    while info["pages"] < max(0, CATCHUP_MAX_PAGES):
+        if info["pages"]:
+            time.sleep(CATCHUP_DELAY)
+        try:
+            rows = parse_job_list(fetch(catchup_url(page)))
+        except FetchError as e:
+            info["reason"] = f"{page}페이지에서 중단: {e}"
+            break
+        info["pages"] += 1
+        if not rows:
+            info.update(complete=True, reason="목록 끝")
+            break
+        dates = [d for d in (_parse_date(r.get("registered", "")) for r in rows) if d]
+        if not restarted and dates and max(dates) < window_start:
+            log(f"  {page}페이지가 이미 {LIST_WINDOW_DAYS}일보다 오래되어 1페이지부터 다시 읽습니다.")
+            restarted, page, collected = True, 1, []
+            continue
+        collected.extend(rows)
+        if cutoff is None or (dates and min(dates) < cutoff):
+            info.update(complete=True, reason="마지막 성공 시점까지 읽음")
+            break
+        page += 1
+    else:
+        info["reason"] = f"{CATCHUP_MAX_PAGES}페이지 상한에 닿음"
+
+    log(f"누락 보충: {info['pages']}페이지, 공고 {len(collected)}건 ({info['reason'] or '완료'})")
+    return collected, info
+
+
+def merge_jobs(primary: list[dict], extra: list[dict]) -> list[dict]:
+    """ID 기준으로 합친다. 같은 공고는 primary 쪽을 쓴다."""
+    have = {j["id"] for j in primary}
+    return primary + [j for j in extra if j["id"] not in have and not have.add(j["id"])]
 
 
 # --------------------------------------------------------------------------
@@ -984,10 +1076,11 @@ def expire(ch: dict, today: str) -> list[dict]:
         d = hydrate(it)["d_day"]
         too_old = str(it.get("queued", today)) < cutoff
         (dropped if (d is not None and d < 0) or too_old else keep).append(it)
+    # 넘치면 뒤쪽(가장 나중에 들어온, 덜 급한 것)을 버린다. 앞쪽은 마감 임박 순으로 넣은 것이다.
     limit = max(1, OUTBOX_MAX_PENDING)
     if len(keep) > limit:
-        dropped += keep[:-limit]
-        keep = keep[-limit:]
+        dropped += keep[limit:]
+        keep = keep[:limit]
     ch["pending"] = keep
     return dropped
 
@@ -1328,8 +1421,11 @@ def write_report(summary: dict, report_path: str = "") -> None:
             ("결과", "✅ 정상" if summary.get("ok") else "❌ 실패"),
             ("모드", summary.get("mode", "")),
             ("수집", f"{summary.get('collected', 0)}건" if summary.get("fetch_ok") else f"실패 — {summary.get('fetch_error', '')}"),
-            ("신규", f"{summary.get('new', 0)}건 (이번에 대기열 등록 {summary.get('queued', 0)}건, 다음으로 미룸 {summary.get('deferred', 0)}건)"),
+            ("신규", f"{summary.get('new', 0)}건 (대기열 등록 {summary.get('queued', 0)}건)"),
             ("필터 제외", f"{summary.get('filtered', 0)}건"),
+            ("누락 보충", (f"{summary['catchup_pages']}페이지, 추가 {summary.get('catchup_found', 0)}건"
+                         + ("" if summary.get("catchup_complete") else " (일부만)"))
+                        if "catchup_pages" in summary else "-"),
             ("리마인더", f"{summary.get('reminders', 0)}건"),
             ("채널별 전달", ", ".join(f"{k}: {v}건" for k, v in summary.get("delivered", {}).items()) or "-"),
             ("미전송 대기", f"{summary.get('backlog', 0)}건"),
@@ -1396,15 +1492,17 @@ def run_live(jobs: list[dict], fetch_ok: bool, urls: list[str], seen: list[str],
     today = _today_kst().date().isoformat()
 
     # 1) 신규 공고 선별: seen에도 없고 대기열에도 없는 것.
+    #    전부 대기열에 넣는다. 한 번에 몇 건을 보낼지는 대기열(drain)이 조절한다.
+    #    예전처럼 '다음 수집 때 다시 찾기'로 미루면, 수집이 자주 막히는 지금은 며칠씩
+    #    묶이다가 3일 목록 창을 벗어나 사라진다. 대기열은 수집 실패와 무관하게 매번 빠진다.
     known = set(seen) | queued_new_ids(outbox)
-    new = sorted((j for j in jobs if j["id"] not in known), key=sort_key)
-    claimed, deferred = new[:run_capacity()], new[run_capacity():]
-    if deferred:
-        warn(f"신규 공고가 많아 {len(deferred)}건은 다음 실행에 이어서 처리합니다.")
-    log(f"신규 공고: {len(new)}개")
-    summary.update(new=len(new), deferred=len(deferred))
+    claimed = sorted((j for j in jobs if j["id"] not in known), key=sort_key)
+    log(f"신규 공고: {len(claimed)}개")
+    if len(claimed) > run_capacity():
+        log(f"채널당 이번 실행에 {run_capacity()}건까지 보내고, 나머지는 다음 실행에 이어서 보냅니다.")
+    summary.update(new=len(claimed), deferred=max(0, len(claimed) - run_capacity()))
 
-    # 2) 보강·필터는 이번에 처리할 공고에만.
+    # 2) 보강(최대 ENRICH_MAX건, 마감 임박 순)·필터.
     enrich_jobs(claimed)
     include, exclude = _env_list("JOB_INCLUDE_KEYWORDS"), _env_list("JOB_EXCLUDE_KEYWORDS")
     kept = [j for j in claimed if matches_filters(j, include, exclude)]
@@ -1534,6 +1632,17 @@ def main(argv: Optional[list[str]] = None) -> int:
     # ---- live ----
     health = load_health()
     failing_since = health.get("last_success") or health.get("failing_since", "")
+
+    # 목록 창(3일)보다 긴 공백 뒤라면 그 사이 공고를 더 찾아본다.
+    if fetch_ok and needs_catchup(health.get("last_success", "")):
+        extra, info = catch_up(health["last_success"], len(jobs))
+        before = len(jobs)
+        jobs = merge_jobs(jobs, extra)
+        summary.update(collected=len(jobs), catchup_pages=info["pages"],
+                       catchup_found=len(jobs) - before, catchup_complete=info["complete"])
+        if not info["complete"]:
+            warn(f"누락 보충을 끝까지 하지 못했습니다 ({info['reason']}). "
+                 f"마지막 성공({info['from']}) 무렵 공고 일부가 빠졌을 수 있습니다.")
     action, outage = health_update(health, fetch_ok, fetch_error)
     summary.update(consecutive_failures=health["consecutive_failures"],
                    outage_hours=round(outage_hours(health), 1),
