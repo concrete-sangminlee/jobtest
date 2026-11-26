@@ -1,0 +1,23 @@
+# 고정해 둔 버전(액션 SHA, requirements의 ==)이 낡지 않게 매달 갱신 PR을 연다.
+# PR은 Tests 워크플로만 돌리며 시크릿을 쓰지 않는다. 머지 여부는 사람이 정한다.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "deps(actions)"
+
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      python:
+        patterns: ["*"]
+    commit-message:
+      prefix: "deps(pip)"

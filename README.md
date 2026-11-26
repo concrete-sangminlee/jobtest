@@ -157,3 +157,9 @@ python -m pytest tests/ -v                 # 테스트 (네트워크 사용 안 
 공개 저장소의 예약 워크플로는 60일 동안 저장소 활동이 없으면 GitHub이 끈다.
 `keepalive.yml`이 매월 1일·15일에 GitHub API로 예약 워크플로를 다시 켠다. 수집이
 실패하는 동안에도 `health.json`이 매 실행 커밋되므로 저장소 활동은 계속 생긴다.
+
+## 의존성
+
+Python 패키지(`requirements.txt`의 `==`)와 GitHub 액션(커밋 SHA)은 정확히 고정한다. 무인 실행이
+검증하지 않은 새 버전을 받지 않게 하기 위해서다. 고정이 낡지 않도록 Dependabot이 매달 갱신
+PR을 연다(`.github/dependabot.yml`). 그 PR은 시크릿 없이 `Tests`만 돌리고, 머지는 사람이 한다.
