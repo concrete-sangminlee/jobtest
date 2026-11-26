@@ -312,11 +312,19 @@ def test_message_overhead_constant_matches_reality():
 # --------------------------------------------------------------------------
 
 def test_webhook_label_and_redact_hide_token():
-    url = "https://hooks.slack.com/services/T06/B0A/supersecret"
-    assert "supersecret" not in scraper.webhook_label(url)
-    assert "B0A" in scraper.webhook_label(url)
-    msg = f"Max retries exceeded with url: {url}"
-    assert "supersecret" not in scraper.redact(msg, url)
+    url = "https://hooks.slack.com/services/T06AB/B0ACD/supersecret"
+    label = scraper.webhook_label(url)
+    # 공개 저장소의 실행 로그에 URL 조각이 하나도 남지 않아야 한다.
+    for part in ("supersecret", "B0ACD", "T06AB", "hooks.slack.com"):
+        assert part not in label
+    # outbox.json의 채널 키와 맞춰 볼 수 있어야 하고, 채널마다 달라야 한다.
+    assert label == "#" + scraper.channel_key(url)[:8]
+    assert label != scraper.webhook_label(url.replace("supersecret", "other"))
+    msg = f"Max retries exceeded with url: {url} (hook B0ACD in T06AB)"
+    redacted = scraper.redact(msg, url)
+    for part in ("supersecret", "B0ACD", "T06AB"):
+        assert part not in redacted
+    assert "Max retries exceeded" in redacted
 
 
 # --------------------------------------------------------------------------

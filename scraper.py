@@ -809,17 +809,20 @@ def build_slack_message(
 # --------------------------------------------------------------------------
 
 def webhook_label(url: str) -> str:
-    """웹훅 URL에서 토큰을 제거한 식별용 라벨. (로그에 시크릿이 남지 않도록)"""
-    parts = url.rstrip("/").split("/")
-    if len(parts) >= 2:
-        return f".../{parts[-2]}/***"
-    return "***"
+    """로그에 쓰는 채널 식별자. 저장소가 공개라 실행 로그도 누구나 읽을 수 있으므로
+    URL의 어떤 조각(워크스페이스·훅 ID 포함)도 내보내지 않는다. outbox.json의 채널 키와
+    앞부분이 같아서, 로그의 채널과 대기열 항목을 맞춰 볼 수 있다."""
+    return f"#{channel_key(url)[:8]}"
 
 
 def redact(text: str, url: str) -> str:
-    """예외/응답 메시지에 섞여 있을 수 있는 웹훅 토큰을 가린다."""
-    token = url.rstrip("/").rsplit("/", 1)[-1]
-    return text.replace(token, "***") if token else text
+    """응답 메시지에 섞여 있을 수 있는 웹훅 주소를 가린다. 토큰뿐 아니라 워크스페이스·훅 ID
+    같은 경로 조각도 지운다(공개 저장소라 실행 로그도 공개다)."""
+    text = text.replace(url, "***")
+    for part in url.split("://", 1)[-1].split("/")[1:]:
+        if len(part) >= 4 and part != "services":   # 공통 경로 단어는 남긴다
+            text = text.replace(part, "***")
+    return text
 
 
 # 채널(웹훅)이 쓸 수 없게 된 경우의 안내. 운영자가 시크릿을 고쳐야 한다.
@@ -1497,7 +1500,10 @@ def run_live(jobs: list[dict], fetch_ok: bool, urls: list[str], seen: list[str],
     #    묶이다가 3일 목록 창을 벗어나 사라진다. 대기열은 수집 실패와 무관하게 매번 빠진다.
     known = set(seen) | queued_new_ids(outbox)
     claimed = sorted((j for j in jobs if j["id"] not in known), key=sort_key)
-    log(f"신규 공고: {len(claimed)}개")
+    if fetch_ok:
+        log(f"신규 공고: {len(claimed)}개")
+    else:
+        log("수집에 실패해 새 공고 확인은 건너뛰고, 대기열에 남은 것만 보냅니다.")
     if len(claimed) > run_capacity():
         log(f"채널당 이번 실행에 {run_capacity()}건까지 보내고, 나머지는 다음 실행에 이어서 보냅니다.")
     summary.update(new=len(claimed), deferred=max(0, len(claimed) - run_capacity()))
