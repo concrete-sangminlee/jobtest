@@ -119,27 +119,53 @@ def env(monkeypatch, tmp_path):
 # 무음 장애 방지
 # --------------------------------------------------------------------------
 
-def test_fetch_failure_fails_the_run(env, capsys):
+def seed_health(env, hours_ago, **extra):
+    """마지막 성공이 hours_ago시간 전인 health.json을 만든다."""
+    from datetime import timedelta
+    then = (datetime.now(scraper.KST) - timedelta(hours=hours_ago)).isoformat(timespec="minutes")
+    data = {"consecutive_failures": 3, "failing_since": then, "last_error": "차단",
+            "last_alert": "", "alerted": False, "last_success": then, "recent": "oxxx"}
+    data.update(extra)
+    (env.dir / "health.json").write_text(json.dumps(data), encoding="utf-8")
+
+
+def test_occasional_fetch_failure_only_warns(env, capsys):
+    """이 사이트는 러너에 따라 간헐적으로 막힌다. 한두 번의 실패로 빨간 실행을 만들지 않는다."""
+    env.site["error"] = "사이트가 이 실행 환경(GitHub Actions)의 접속을 거부함(403)."
+    env.mp.setenv("GITHUB_ACTIONS", "true")
+    assert env.run() == 0
+    out = capsys.readouterr().out
+    assert "::warning::" in out and "403" in out and "::error" not in out
+    assert env.slack.posts == []
+    h = env.health()
+    assert h["consecutive_failures"] == 1 and h["recent"] == "x"
+
+
+def test_long_outage_fails_the_run_and_alerts(env, capsys):
+    seed_health(env, 50)
     env.site["error"] = "사이트가 이 실행 환경(GitHub Actions)의 접속을 거부함(403)."
     env.mp.setenv("GITHUB_ACTIONS", "true")
     assert env.run() == 1
     out = capsys.readouterr().out
     assert "::error" in out and "403" in out
-    assert env.health()["consecutive_failures"] == 1
-
-
-def test_repeated_fetch_failure_alerts_once_then_daily(env, monkeypatch):
-    env.site["error"] = "차단(403)"
-    monkeypatch.setattr(scraper, "HEALTH_ALERT_AFTER", 2)
-
-    assert env.run() == 1
-    assert env.slack.posts == [], "첫 실패에서는 아직 경보하지 않는다 (일시적 오류일 수 있음)"
-
-    assert env.run() == 1
     assert len(env.slack.posts) == 1
     text = env.slack.posts[0][1]["attachments"][0]["blocks"][0]["text"]["text"]
-    assert "2회 연속 실패" in text and "차단(403)" in text
+    assert "시간째 성공하지 못했습니다" in text and "403" in text and "최근 5회 중 1회 성공" in text
 
+
+def test_short_outage_does_not_alert(env, monkeypatch):
+    monkeypatch.setattr(scraper, "HEALTH_ALERT_HOURS", 48)
+    seed_health(env, 30)
+    env.site["error"] = "차단"
+    assert env.run() == 0
+    assert env.slack.posts == []
+
+
+def test_alert_is_repeated_at_most_daily(env):
+    seed_health(env, 50)
+    env.site["error"] = "차단"
+    assert env.run() == 1
+    assert len(env.slack.posts) == 1
     assert env.run() == 1
     assert len(env.slack.posts) == 1, "같은 날 경보를 반복하면 안 된다"
 
@@ -150,8 +176,8 @@ def test_repeated_fetch_failure_alerts_once_then_daily(env, monkeypatch):
     assert len(env.slack.posts) == 2, "하루가 지나면 다시 알린다"
 
 
-def test_recovery_is_announced_once(env, monkeypatch):
-    monkeypatch.setattr(scraper, "HEALTH_ALERT_AFTER", 1)
+def test_recovery_is_announced_once(env):
+    seed_health(env, 50)
     env.site["error"] = "차단"
     env.run()
     assert len(env.slack.posts) == 1
@@ -161,15 +187,23 @@ def test_recovery_is_announced_once(env, monkeypatch):
     assert env.run() == 0
     texts = [m["attachments"][0]["blocks"][0]["text"]["text"] for _, m in env.slack.posts]
     assert any("복구" in t for t in texts)
-    assert env.health()["consecutive_failures"] == 0
+    h = env.health()
+    assert h["consecutive_failures"] == 0 and h["alerted"] is False and h["recent"].endswith("o")
 
     env.slack.posts.clear()
     env.run()
     assert not any("복구" in json.dumps(m, ensure_ascii=False) for _, m in env.slack.posts)
 
 
-def test_failed_alert_is_retried_next_run(env, monkeypatch):
-    monkeypatch.setattr(scraper, "HEALTH_ALERT_AFTER", 1)
+def test_success_without_prior_alert_sends_no_recovery_notice(env):
+    seed_health(env, 30)
+    env.site["jobs"] = [job(1)]
+    env.run()
+    assert not any("복구" in json.dumps(m, ensure_ascii=False) for _, m in env.slack.posts)
+
+
+def test_failed_alert_is_retried_next_run(env):
+    seed_health(env, 50)
     env.site["error"] = "차단"
     env.slack.script[A] = [Resp(500, "")] * 3
     assert env.run() == 1
@@ -179,11 +213,27 @@ def test_failed_alert_is_retried_next_run(env, monkeypatch):
 
 
 def test_separate_alert_channel(env, monkeypatch):
-    monkeypatch.setattr(scraper, "HEALTH_ALERT_AFTER", 1)
+    seed_health(env, 50)
     monkeypatch.setenv("SLACK_ALERT_WEBHOOK_URL", B)
     env.site["error"] = "차단"
     env.run()
     assert env.slack.to(A) == [] and len(env.slack.to(B)) == 1
+
+
+def test_outage_clock_starts_at_first_failure_without_history(env, monkeypatch):
+    """성공 기록이 없으면 첫 실패부터 센다. 기록이 없다고 바로 경보하지 않는다."""
+    monkeypatch.setattr(scraper, "HEALTH_ALERT_HOURS", 48)
+    env.site["error"] = "차단"
+    for _ in range(3):
+        assert env.run() == 0
+    assert env.slack.posts == []
+    assert env.health()["recent"] == "xxx"
+
+
+def test_history_is_bounded():
+    h = {"recent": "o" * 100}
+    scraper.health_update(h, False, "x")
+    assert len(h["recent"]) == scraper.HEALTH_HISTORY and h["recent"].endswith("x")
 
 
 def test_missing_webhook_fails_before_touching_the_site(env, monkeypatch):
@@ -195,6 +245,7 @@ def test_missing_webhook_fails_before_touching_the_site(env, monkeypatch):
 def test_failure_reported_output(env, monkeypatch, tmp_path):
     out = tmp_path / "gh_output"
     monkeypatch.setenv("GITHUB_OUTPUT", str(out))
+    seed_health(env, 50)
     env.site["error"] = "차단"
     env.run()
     assert "failure_reported=true" in out.read_text()

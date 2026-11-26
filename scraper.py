@@ -85,9 +85,12 @@ ENRICH_MAX = _env_int("ENRICH_MAX", 30)
 OUTBOX_TTL_DAYS = _env_int("OUTBOX_TTL_DAYS", 3)
 OUTBOX_MAX_PENDING = _env_int("OUTBOX_MAX_PENDING", 500)
 
-# 수집이 연속으로 실패하면 Slack에 경보를 보낸다. 이후에는 하루 한 번만 다시 알린다.
-HEALTH_ALERT_AFTER = _env_int("HEALTH_ALERT_AFTER", 2)
+# 수집 감시. 이 사이트는 실행 환경(러너 IP)에 따라 간헐적으로 접속을 거부한다.
+# 한두 번의 실패는 흔하므로 경고만 남기고, 마지막 성공 후 HEALTH_ALERT_HOURS가 지나면
+# 실행을 실패로 표시하고 Slack에 경보를 보낸다. 이후에는 HEALTH_REALERT_HOURS마다 한 번만.
+HEALTH_ALERT_HOURS = _env_int("HEALTH_ALERT_HOURS", 48)
 HEALTH_REALERT_HOURS = _env_int("HEALTH_REALERT_HOURS", 24)
+HEALTH_HISTORY = 30   # 최근 몇 번의 수집 결과를 기록할지
 
 # 마감 임박 리마인더: 알림할 남은 일수 목록 (예: "3,1"). 비어 있으면 기능 꺼짐.
 REMINDER_DAYS = sorted({int(d) for d in _env_list("REMINDER_DAYS") if d.isdigit()}, reverse=True)
@@ -1200,6 +1203,7 @@ def _now_iso() -> str:
 
 def load_health() -> dict:
     data = _read_json(HEALTH_FILE, dict, "health.json")
+    recent = data.get("recent") or ""
     return {
         "consecutive_failures": int(data.get("consecutive_failures") or 0),
         "failing_since": data.get("failing_since") or "",
@@ -1207,6 +1211,8 @@ def load_health() -> dict:
         "last_alert": data.get("last_alert") or "",
         "alerted": bool(data.get("alerted")),
         "last_success": data.get("last_success") or "",
+        # 최근 수집 결과. 'o' 성공, 'x' 실패, 오래된 것부터.
+        "recent": "".join(c for c in str(recent) if c in "ox")[-HEALTH_HISTORY:],
     }
 
 
@@ -1222,31 +1228,49 @@ def _hours_since(iso: str) -> float:
     return (datetime.now(KST) - then).total_seconds() / 3600
 
 
-def health_update(health: dict, ok: bool, reason: str = "") -> Optional[str]:
-    """수집 결과를 기록하고, 보낼 경보 종류를 돌려준다.
+def outage_hours(health: dict) -> float:
+    """수집이 성공하지 못한 시간. 성공 기록이 없으면 첫 실패부터 센다."""
+    since = health.get("last_success") or health.get("failing_since")
+    if not since or int(health.get("consecutive_failures") or 0) == 0:
+        return 0.0
+    hours = _hours_since(since)
+    return 0.0 if hours == float("inf") else max(0.0, hours)
 
-    'failing'   — 연속 실패가 HEALTH_ALERT_AFTER회에 도달 (이후 HEALTH_REALERT_HOURS마다 한 번)
-    'recovered' — 경보를 보낸 뒤 처음 성공
-    None        — 보낼 것 없음
+
+def success_rate(health: dict) -> str:
+    recent = health.get("recent", "")
+    return f"최근 {len(recent)}회 중 {recent.count('o')}회 성공" if recent else "기록 없음"
+
+
+def health_update(health: dict, ok: bool, reason: str = "") -> tuple[Optional[str], bool]:
+    """수집 결과를 기록한다. (보낼 경보 종류, 장애로 볼지)를 돌려준다.
+
+    경보 종류:
+      'failing'   — 마지막 성공 후 HEALTH_ALERT_HOURS가 지났다 (이후 HEALTH_REALERT_HOURS마다 한 번)
+      'recovered' — 경보를 보낸 뒤 처음 성공
+      None        — 보낼 것 없음
+    장애로 볼지: 마지막 성공 후 HEALTH_ALERT_HOURS가 지났으면 True (실행을 실패로 표시).
+    그 전의 실패는 이 사이트에서 흔한 일시적 차단이므로 경고만 남긴다.
     """
     now = _now_iso()
+    health["recent"] = (health.get("recent", "") + ("o" if ok else "x"))[-HEALTH_HISTORY:]
     if ok:
         action = "recovered" if health.get("alerted") else None
         health.update(consecutive_failures=0, failing_since="", last_error="",
                       alerted=False, last_success=now)
-        return action
+        return action, False
 
     health["consecutive_failures"] = int(health.get("consecutive_failures") or 0) + 1
     if not health.get("failing_since"):
         health["failing_since"] = now
     health["last_error"] = reason[:300]
-    if health["consecutive_failures"] < max(1, HEALTH_ALERT_AFTER):
-        return None
+    if outage_hours(health) < max(1, HEALTH_ALERT_HOURS):
+        return None, False
     if health.get("alerted") and _hours_since(health.get("last_alert", "")) < HEALTH_REALERT_HOURS:
-        return None
+        return None, True
     health["alerted"] = True
     health["last_alert"] = now
-    return "failing"
+    return "failing", True
 
 
 def _run_url() -> str:
@@ -1259,14 +1283,15 @@ def build_health_message(action: str, health: dict) -> dict:
     run_url = _run_url()
     if action == "recovered":
         text = (f"✅ *하이브레인 알림 봇이 복구되었습니다.*\n"
-                f"공고 수집이 다시 정상입니다. (장애 시작: {health.get('recovered_from', '-')})")
+                f"공고 수집이 다시 정상입니다. (이전 마지막 성공: {health.get('recovered_from') or '기록 없음'})")
         color = "#2eb67d"
     else:
         last_ok = health.get("last_success") or "기록 없음"
-        text = (f"🚨 *하이브레인 공고 수집이 {health['consecutive_failures']}회 연속 실패했습니다.*\n"
+        hours = int(outage_hours(health))
+        text = (f"🚨 *하이브레인 공고 수집이 {hours}시간째 성공하지 못했습니다.*\n"
                 f"이 상태에서는 신규 공고 알림이 나가지 않습니다.\n"
                 f"• 원인: {mrk(health.get('last_error', ''), 300)}\n"
-                f"• 실패 시작: {health.get('failing_since')}  ｜  마지막 성공: {last_ok}")
+                f"• 마지막 성공: {last_ok}  ｜  연속 실패 {health['consecutive_failures']}회  ｜  {success_rate(health)}")
         color = "#e01e5a"
     if run_url:
         text += f"\n• 실행 로그: <{run_url}|GitHub Actions>"
@@ -1308,7 +1333,9 @@ def write_report(summary: dict, report_path: str = "") -> None:
             ("리마인더", f"{summary.get('reminders', 0)}건"),
             ("채널별 전달", ", ".join(f"{k}: {v}건" for k, v in summary.get("delivered", {}).items()) or "-"),
             ("미전송 대기", f"{summary.get('backlog', 0)}건"),
-            ("연속 수집 실패", f"{summary.get('consecutive_failures', 0)}회"),
+            ("연속 수집 실패", f"{summary.get('consecutive_failures', 0)}회"
+                            + (f" (마지막 성공 후 {summary['outage_hours']:.0f}시간)" if summary.get("outage_hours") else "")),
+            ("최근 수집", summary.get("success_rate", "-")),
         ]
         if summary.get("problems"):
             rows.append(("문제", "<br>".join(html_escape(p) for p in summary["problems"])))
@@ -1506,15 +1533,22 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     # ---- live ----
     health = load_health()
-    failing_since = health.get("failing_since", "")
-    action = health_update(health, fetch_ok, fetch_error)
-    summary["consecutive_failures"] = health["consecutive_failures"]
+    failing_since = health.get("last_success") or health.get("failing_since", "")
+    action, outage = health_update(health, fetch_ok, fetch_error)
+    summary.update(consecutive_failures=health["consecutive_failures"],
+                   outage_hours=round(outage_hours(health), 1),
+                   last_success=health.get("last_success", ""),
+                   success_rate=success_rate(health))
     save_health(health)
 
     if not fetch_ok:
-        summary["problems"].append(
-            f"공고 수집 실패 ({health['consecutive_failures']}회 연속): {fetch_error}"
-        )
+        detail = (f"공고 수집 실패 (연속 {health['consecutive_failures']}회, "
+                  f"마지막 성공 후 {outage_hours(health):.0f}시간): {fetch_error}")
+        if outage:
+            summary["problems"].append(detail)
+        else:
+            # 일시적 차단은 흔하다. 실행을 빨갛게 만들지 않고 기록만 남긴다.
+            warn(f"{detail} — {HEALTH_ALERT_HOURS}시간 동안 성공하지 못하면 경보를 보냅니다.")
 
     # 수집이 실패해도 밀린 대기열과 리마인더는 보낸다.
     run_live(jobs, fetch_ok, urls, seen, outbox, summary)
