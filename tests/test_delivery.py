@@ -748,3 +748,163 @@ def test_already_closed_jobs_are_recorded_but_not_announced(env):
     assert env.run() == 0
     assert env.slack.ids_to(A) == ["2"]
     assert set(env.seen()) == {"1", "2"}
+
+
+# --------------------------------------------------------------------------
+# 누락 보충 (3일 목록 창보다 긴 공백 뒤)
+# --------------------------------------------------------------------------
+
+def list_html(rows):
+    """rows: [(id, 'YY.MM.DD')] → 목록 페이지 HTML 조각."""
+    items = "".join(
+        f'<li class="row"><span class="td_title"><a href="/recruitment/recruits/{i}" title="공고 {i}">공고 {i}</a></span>'
+        f'<span class="td_rdtm number">{d}</span></li>'
+        for i, d in rows
+    )
+    return f'<ul id="articleList">{items}</ul>'
+
+
+def test_rows_carry_registered_date():
+    jobs = scraper.parse_job_list(list_html([(1, "26.11.25")]))
+    assert jobs[0]["registered"] == "26.11.25"
+
+
+def test_needs_catchup_only_after_long_gap(monkeypatch):
+    from datetime import timedelta
+    monkeypatch.setattr(scraper, "CATCHUP_AFTER_HOURS", 60)
+    ago = lambda h: (datetime.now(scraper.KST) - timedelta(hours=h)).isoformat(timespec="minutes")
+    assert scraper.needs_catchup(ago(70)) is True
+    assert scraper.needs_catchup(ago(30)) is False
+    assert scraper.needs_catchup("") is False, "기록이 없으면 보충하지 않는다"
+
+
+def test_catch_up_reads_back_to_last_success(monkeypatch):
+    monkeypatch.setattr(scraper.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(scraper, "_today_kst", lambda: TODAY)          # 11/12
+    pages = {1: [(10, "26.11.12"), (11, "26.11.11")],
+             2: [(12, "26.11.10"), (13, "26.11.09")],
+             3: [(14, "26.11.07"), (15, "26.11.06")],                    # 컷오프(11/07) 이전이 섞임 → 여기서 멈춤
+             4: [(16, "26.11.05")]}
+    calls = []
+
+    def fetcher(url):
+        page = int(url.split("page=")[1].split("&")[0])
+        calls.append(page)
+        return list_html(pages.get(page, []))
+
+    jobs, info = scraper.catch_up("2026-11-08T10:00+09:00", 0, fetcher)
+    assert calls == [1, 2, 3], "컷오프를 지나서도 더 읽었다"
+    assert info["complete"] is True
+    assert [j["id"] for j in jobs] == ["10", "11", "12", "13", "14", "15"]
+
+
+def test_catch_up_restarts_when_start_page_overshoots(monkeypatch):
+    monkeypatch.setattr(scraper.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(scraper, "_today_kst", lambda: TODAY)
+    calls = []
+
+    def fetcher(url):
+        page = int(url.split("page=")[1].split("&")[0])
+        calls.append(page)
+        if page == 6:
+            return list_html([(90, "26.10.01")])                        # 3일보다 훨씬 오래됨 → 너무 멀리 옴
+        return list_html([(page, "26.11.05")])
+
+    jobs, info = scraper.catch_up("2026-11-07T10:00+09:00", 600, fetcher)   # 600 // 100 = 6페이지부터
+    assert calls[:2] == [6, 1]
+    assert info["complete"] and [j["id"] for j in jobs] == ["1"]
+
+
+def test_catch_up_stops_when_blocked_and_keeps_what_it_read(monkeypatch):
+    monkeypatch.setattr(scraper.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(scraper, "_today_kst", lambda: TODAY)
+
+    def fetcher(url):
+        if "page=2&" in url:
+            raise scraper.FetchError("403")
+        return list_html([(1, "26.11.11")])
+
+    jobs, info = scraper.catch_up("2026-11-05T10:00+09:00", 0, fetcher)
+    assert [j["id"] for j in jobs] == ["1"]
+    assert info["complete"] is False and "2페이지" in info["reason"]
+
+
+def test_catch_up_respects_page_cap_and_delay(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(scraper.time, "sleep", sleeps.append)
+    monkeypatch.setattr(scraper, "_today_kst", lambda: TODAY)
+    monkeypatch.setattr(scraper, "CATCHUP_MAX_PAGES", 3)
+    monkeypatch.setattr(scraper, "CATCHUP_DELAY", 2)
+    calls = []
+
+    def fetcher(url):
+        calls.append(url)
+        return list_html([(len(calls), "26.11.11")])
+
+    jobs, info = scraper.catch_up("2026-10-01T10:00+09:00", 0, fetcher)
+    assert len(calls) == 3 and info["complete"] is False and "상한" in info["reason"]
+    assert sleeps == [2, 2], "페이지 사이에 쉬지 않았다"
+
+
+def test_catch_up_uses_site_pagination_format():
+    url = scraper.catchup_url(7)
+    assert url.startswith("https://hibrain.net/recruitment/recruits?page=7&")
+    assert "listType=ING" in url and "sortType=SORTDTM" in url and "limit=25" in url
+
+
+def test_long_gap_triggers_catch_up_and_delivers_missed_jobs(env, monkeypatch):
+    seed_health(env, 70)
+    env.site["jobs"] = [job(1)]
+    pages = []
+
+    def chain(url, attempts=0):
+        pages.append(url)
+        return list_html([(500, "26.11.01"), (501, "26.11.01")])      # 컷오프보다 오래됨 → 1페이지로 끝
+
+    monkeypatch.setattr(scraper, "_fetch_chain", chain)
+    assert env.run() == 0
+    assert len(pages) == 1
+    assert sorted(env.slack.ids_to(A)) == ["1", "500", "501"]
+
+
+def test_short_gap_does_not_catch_up(env, monkeypatch):
+    seed_health(env, 30)
+    env.site["jobs"] = [job(1)]
+    monkeypatch.setattr(scraper, "_fetch_chain",
+                        lambda *a, **k: pytest.fail("짧은 공백인데 추가 목록을 읽었다"))
+    assert env.run() == 0
+
+
+def test_no_catch_up_when_fetch_failed(env, monkeypatch):
+    seed_health(env, 70)
+    env.site["error"] = "차단"
+    monkeypatch.setattr(scraper, "_fetch_chain",
+                        lambda *a, **k: pytest.fail("수집이 실패했는데 추가 목록을 읽었다"))
+    env.run()
+
+
+def test_backlog_drains_even_when_later_fetches_fail(env, monkeypatch):
+    """한 실행 처리량을 넘는 신규는 대기열에서 이어서 나간다. 다음 수집 성공을 기다리지 않는다."""
+    monkeypatch.setattr(scraper, "JOBS_PER_MESSAGE", 10)
+    monkeypatch.setattr(scraper, "MAX_MESSAGES", 2)
+    env.site["jobs"] = [job(i) for i in range(1, 46)]
+    assert env.run() == 0
+    assert len(env.slack.ids_to(A)) == 20
+
+    env.site["jobs"], env.site["error"] = [], "차단"
+    env.slack.posts.clear()
+    env.run()
+    assert len(env.slack.ids_to(A)) == 20, "수집이 막힌 실행에서 대기열이 빠지지 않았다"
+    env.slack.posts.clear()
+    env.run()
+    assert len(env.slack.ids_to(A)) == 5
+    assert len(set(env.seen())) == 45
+
+
+def test_outbox_overflow_drops_least_urgent(monkeypatch):
+    monkeypatch.setattr(scraper, "OUTBOX_MAX_PENDING", 2)
+    ch = {"pending": [{"kind": "new", "id": str(i), "queued": "2026-11-12",
+                       "job": {"title": "t", "url": job(i)["url"]}} for i in (1, 2, 3)]}
+    dropped = scraper.expire(ch, "2026-11-12")
+    assert [it["id"] for it in ch["pending"]] == ["1", "2"]
+    assert [it["id"] for it in dropped] == ["3"]
